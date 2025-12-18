@@ -38,6 +38,11 @@ from .worker import (
     PipInstall,
     Ec2Tag,
 )
+from .worker_host import (
+    WorkerHost,
+    WorkerHostState,
+    WorkerAgentState,
+)
 
 __all__ = [
     "CloudWatchLogEvent",
@@ -72,6 +77,9 @@ __all__ = [
     "TaskStatus",
     "WindowsInstanceBuildWorker",
     "WindowsInstanceWorkerBase",
+    "WorkerAgentState",
+    "WorkerHost",
+    "WorkerHostState",
     "WorkerLog",
     "Ec2Tag",
 ]

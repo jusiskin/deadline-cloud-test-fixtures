@@ -22,6 +22,9 @@ from .deadline import (
     Step,
     Task,
     TaskStatus,
+    WorkerAgentState,
+    WorkerHost,
+    WorkerHostState,
     Ec2Tag,
 )
 from .fixtures import (
@@ -82,6 +85,9 @@ __all__ = [
     "TaskStatus",
     "WindowsInstanceBuildWorker",
     "WindowsInstanceWorkerBase",
+    "WorkerAgentState",
+    "WorkerHost",
+    "WorkerHostState",
     "bootstrap_resources",
     "codeartifact",
     "deadline_client",
