@@ -7,6 +7,7 @@ from .deadline import (
     DeadlineWorkerConfiguration,
     DockerContainerWorker,
     EC2InstanceWorker,
+    EC2WorkerHost,
     WindowsInstanceWorkerBase,
     WindowsInstanceBuildWorker,
     PosixInstanceWorkerBase,
@@ -63,6 +64,8 @@ __all__ = [
     "DeadlineWorkerConfiguration",
     "DockerContainerWorker",
     "EC2InstanceWorker",
+    "EC2WorkerHost",
+    "Ec2Tag",
     "Farm",
     "Fleet",
     "Job",
@@ -98,5 +101,4 @@ __all__ = [
     "version",
     "worker_config",
     "worker",
-    "Ec2Tag",
 ]

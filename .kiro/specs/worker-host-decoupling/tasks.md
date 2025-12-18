@@ -20,7 +20,7 @@
   - _Requirements: 2.1, 3.2, 4.1_
   - _Validates: Requirements 1.1, 2.3_
 
-- [ ] 2. Create EC2WorkerHost base class and property test
+- [x] 2. Create EC2WorkerHost base class and property test
   - Create `EC2WorkerHost` abstract base class extending `WorkerHost`
   - Move EC2-specific fields from `EC2InstanceWorker` to `EC2WorkerHost`
   - Implement common EC2 functionality (AMI resolution, instance launching, SSM commands)

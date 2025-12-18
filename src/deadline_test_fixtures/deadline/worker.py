@@ -23,8 +23,9 @@ from ..models import (
     PipInstall,
     PosixSessionUser,
 )
-from ..util import call_api, is_instance_not_ready, retry_with_predicate, wait_for
 from .resources import CloudWatchLogEvent, Fleet, WorkerLog
+from .worker_host import Ec2Tag, CommandResult
+from ..util import call_api, wait_for, retry_with_predicate, is_instance_not_ready
 
 if TYPE_CHECKING:
     from botocore.paginate import PageIterator, Paginator
@@ -37,12 +38,6 @@ DEFAULT_WAITER_CONFIG = {
     "Delay": 5,
     "MaxAttempts": 30,
 }
-
-
-@dataclass
-class Ec2Tag:
-    key: str
-    value: str
 
 
 class DeadlineWorker(abc.ABC):
@@ -70,40 +65,6 @@ class WorkerLogConfig:
 
     cloudwatch_log_stream: str
     """The name of the CloudWatch Log Stream that the Agent log should be streamed to"""
-
-
-@dataclass(frozen=True)
-class CommandResult:  # pragma: no cover
-    exit_code: int
-    stdout: str
-    stderr: Optional[str] = None
-
-    def __str__(self) -> str:
-        return "\n".join(
-            [
-                f"exit_code: {self.exit_code}",
-                "",
-                "================================",
-                "========= BEGIN stdout =========",
-                "================================",
-                "",
-                self.stdout,
-                "",
-                "==============================",
-                "========= END stdout =========",
-                "==============================",
-                "",
-                "================================",
-                "========= BEGIN stderr =========",
-                "================================",
-                "",
-                str(self.stderr),
-                "",
-                "==============================",
-                "========= END stderr =========",
-                "==============================",
-            ]
-        )
 
 
 class InstanceStartupError(Exception):

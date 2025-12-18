@@ -8,8 +8,11 @@ from deadline_test_fixtures.deadline.worker_host import (
     WorkerHost,
     WorkerHostState,
     WorkerAgentState,
+    EC2WorkerHost,
+    Ec2Tag,
+    CommandResult,
 )
-from deadline_test_fixtures.deadline.worker import CommandResult
+from unittest.mock import Mock
 
 
 class MockWorkerHost(WorkerHost):
@@ -275,3 +278,138 @@ class TestWorkerHostState:
         assert WorkerHostState.NOT_STARTED.value == "not_started"
         assert WorkerHostState.RUNNING.value == "running"
         assert WorkerHostState.STOPPED.value == "stopped"
+
+
+class MockEC2WorkerHost(EC2WorkerHost):
+    """Mock implementation of EC2WorkerHost for testing."""
+
+    def __init__(self, operating_system: str = "posix"):
+        # Create mock clients
+        mock_s3_client = Mock()
+        mock_ec2_client = Mock()
+        mock_ssm_client = Mock()
+
+        # Mock SSM parameter response for AMI ID
+        mock_ssm_client.get_parameters.return_value = {"Parameters": [{"Value": "ami-12345678"}]}
+
+        # Mock EC2 run_instances response
+        mock_ec2_client.run_instances.return_value = {
+            "Instances": [{"InstanceId": "i-1234567890abcdef0"}]
+        }
+
+        # Mock EC2 waiter
+        mock_waiter = Mock()
+        mock_ec2_client.get_waiter.return_value = mock_waiter
+
+        # Mock SSM send_command response
+        mock_ssm_client.send_command.return_value = {"Command": {"CommandId": "cmd-12345"}}
+
+        # Mock SSM get_command_invocation response
+        mock_ssm_client.get_command_invocation.return_value = {
+            "ResponseCode": 0,
+            "StandardOutputContent": "mock output",
+            "StandardErrorContent": "",
+        }
+
+        # Mock SSM waiter
+        mock_ssm_waiter = Mock()
+        mock_ssm_client.get_waiter.return_value = mock_ssm_waiter
+
+        super().__init__(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            s3_client=mock_s3_client,
+            ec2_client=mock_ec2_client,
+            ssm_client=mock_ssm_client,
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+        )
+        self._os = operating_system
+
+    def _operating_system(self) -> str:
+        return self._os
+
+    def ami_ssm_param_name(self) -> str:
+        return "/test/ami/parameter"
+
+    def ssm_document_name(self) -> str:
+        return "AWS-RunShellScript" if self._os == "posix" else "AWS-RunPowerShellScript"
+
+    def userdata(self, s3_files: list[tuple[str, str]] | None) -> str:
+        return "#!/bin/bash\necho 'test userdata'"
+
+    def ebs_devices(self) -> dict[str, int] | None:
+        return {"/dev/xvda": 30} if self._os == "posix" else {"/dev/sda1": 60}
+
+
+class TestEC2WorkerHost:
+    """Test EC2WorkerHost base class functionality."""
+
+    def test_ec2_worker_host_initialization(self):
+        """Test that EC2WorkerHost initializes correctly."""
+        host = MockEC2WorkerHost()
+        assert host.state == WorkerHostState.NOT_STARTED
+        assert not host.has_active_worker
+        assert host.instance_id is None
+        assert host.subnet_id == "subnet-12345"
+        assert host.security_group_id == "sg-12345"
+
+    def test_ec2_worker_host_ami_id_resolution(self):
+        """Test that AMI ID is resolved from SSM parameter."""
+        host = MockEC2WorkerHost()
+        ami_id = host.ami_id
+        assert ami_id == "ami-12345678"
+        host.ssm_client.get_parameters.assert_called_once_with(Names=["/test/ami/parameter"])
+
+    def test_ec2_worker_host_start_launches_instance(self):
+        """Test that starting EC2WorkerHost launches an instance."""
+        host = MockEC2WorkerHost()
+        host.start()
+
+        assert host.state == WorkerHostState.RUNNING
+        assert host.instance_id == "i-1234567890abcdef0"
+        host.ec2_client.run_instances.assert_called_once()
+
+    def test_ec2_worker_host_stop_terminates_instance(self):
+        """Test that stopping EC2WorkerHost terminates the instance."""
+        host = MockEC2WorkerHost()
+        host.start()
+        host.stop()
+
+        assert host.state == WorkerHostState.STOPPED
+        assert host.instance_id is None
+        host.ec2_client.terminate_instances.assert_called_once_with(
+            InstanceIds=["i-1234567890abcdef0"]
+        )
+
+    def test_ec2_worker_host_send_command(self):
+        """Test that EC2WorkerHost can send commands via SSM."""
+        host = MockEC2WorkerHost()
+        host.start()
+
+        result = host.send_command("echo 'test'")
+
+        assert result.exit_code == 0
+        assert result.stdout == "mock output"
+        host.ssm_client.send_command.assert_called_once()
+
+
+class TestEc2Tag:
+    """Test Ec2Tag dataclass."""
+
+    def test_ec2_tag_creation(self):
+        """Test that Ec2Tag can be created with key and value."""
+        tag = Ec2Tag(key="Environment", value="Test")
+        assert tag.key == "Environment"
+        assert tag.value == "Test"
+
+    def test_ec2_tag_equality(self):
+        """Test that Ec2Tag instances with same values are equal."""
+        tag1 = Ec2Tag(key="Environment", value="Test")
+        tag2 = Ec2Tag(key="Environment", value="Test")
+        tag3 = Ec2Tag(key="Environment", value="Production")
+
+        assert tag1 == tag2
+        assert tag1 != tag3

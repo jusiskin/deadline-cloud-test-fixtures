@@ -26,7 +26,6 @@ from .resources import (
     WorkerLog,
 )
 from .worker import (
-    CommandResult,
     DeadlineWorker,
     DeadlineWorkerConfiguration,
     DockerContainerWorker,
@@ -36,12 +35,14 @@ from .worker import (
     WindowsInstanceWorkerBase,
     WindowsInstanceBuildWorker,
     PipInstall,
-    Ec2Tag,
 )
 from .worker_host import (
     WorkerHost,
     WorkerHostState,
     WorkerAgentState,
+    EC2WorkerHost,
+    Ec2Tag,
+    CommandResult,
 )
 
 __all__ = [
@@ -53,6 +54,8 @@ __all__ = [
     "DependencyCounts",
     "DockerContainerWorker",
     "EC2InstanceWorker",
+    "EC2WorkerHost",
+    "Ec2Tag",
     "Farm",
     "Fleet",
     "FloatTaskParameterValue",
@@ -81,5 +84,4 @@ __all__ = [
     "WorkerHost",
     "WorkerHostState",
     "WorkerLog",
-    "Ec2Tag",
 ]
