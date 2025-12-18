@@ -9,6 +9,8 @@ from deadline_test_fixtures.deadline.worker_host import (
     WorkerHostState,
     WorkerAgentState,
     EC2WorkerHost,
+    WindowsEC2WorkerHost,
+    PosixEC2WorkerHost,
     Ec2Tag,
     CommandResult,
 )
@@ -413,3 +415,272 @@ class TestEc2Tag:
 
         assert tag1 == tag2
         assert tag1 != tag3
+
+
+class TestWindowsEC2WorkerHost:
+    """Test WindowsEC2WorkerHost implementation."""
+
+    def test_windows_ec2_worker_host_operating_system(self):
+        """Test that WindowsEC2WorkerHost returns 'windows' as operating system."""
+        mock_clients = {
+            "s3_client": Mock(),
+            "ec2_client": Mock(),
+            "ssm_client": Mock(),
+        }
+        mock_clients["ssm_client"].get_parameters.return_value = {
+            "Parameters": [{"Value": "ami-windows123"}]
+        }
+
+        host = WindowsEC2WorkerHost(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        assert host._operating_system() == "windows"
+        assert host.ssm_document_name() == "AWS-RunPowerShellScript"
+        assert host.ebs_devices() == {"/dev/sda1": 60}
+        assert "Windows_Server-2022-English-Full-Base" in host.ami_ssm_param_name()
+
+    def test_windows_ec2_worker_host_userdata(self):
+        """Test that WindowsEC2WorkerHost generates Windows userdata."""
+        mock_clients = {
+            "s3_client": Mock(),
+            "ec2_client": Mock(),
+            "ssm_client": Mock(),
+        }
+        mock_clients["ssm_client"].get_parameters.return_value = {
+            "Parameters": [{"Value": "ami-windows123"}]
+        }
+
+        host = WindowsEC2WorkerHost(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        userdata = host.userdata(None)
+        assert "<powershell>" in userdata
+        assert "python-3.12.10-amd64.exe" in userdata
+
+
+class TestPosixEC2WorkerHost:
+    """Test PosixEC2WorkerHost implementation."""
+
+    def test_posix_ec2_worker_host_operating_system(self):
+        """Test that PosixEC2WorkerHost returns 'posix' as operating system."""
+        mock_clients = {
+            "s3_client": Mock(),
+            "ec2_client": Mock(),
+            "ssm_client": Mock(),
+        }
+        mock_clients["ssm_client"].get_parameters.return_value = {
+            "Parameters": [{"Value": "ami-linux123"}]
+        }
+
+        host = PosixEC2WorkerHost(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        assert host._operating_system() == "posix"
+        assert host.ssm_document_name() == "AWS-RunShellScript"
+        assert host.ebs_devices() == {"/dev/xvda": 30}
+        assert "al2023-ami-kernel-6.1-x86_64" in host.ami_ssm_param_name()
+
+    def test_posix_ec2_worker_host_userdata(self):
+        """Test that PosixEC2WorkerHost generates POSIX userdata."""
+        mock_clients = {
+            "s3_client": Mock(),
+            "ec2_client": Mock(),
+            "ssm_client": Mock(),
+        }
+        mock_clients["ssm_client"].get_parameters.return_value = {
+            "Parameters": [{"Value": "ami-linux123"}]
+        }
+
+        host = PosixEC2WorkerHost(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        userdata = host.userdata(None)
+        assert "#!/bin/bash" in userdata
+        assert "mkdir /opt/deadline" in userdata
+
+    def test_posix_ec2_worker_host_send_command_adds_safety_flags(self):
+        """Test that PosixEC2WorkerHost adds bash safety flags to commands."""
+        mock_clients = {
+            "s3_client": Mock(),
+            "ec2_client": Mock(),
+            "ssm_client": Mock(),
+        }
+        mock_clients["ssm_client"].get_parameters.return_value = {
+            "Parameters": [{"Value": "ami-linux123"}]
+        }
+
+        # Mock SSM send_command and related responses
+        mock_clients["ssm_client"].send_command.return_value = {
+            "Command": {"CommandId": "cmd-12345"}
+        }
+        mock_clients["ssm_client"].get_command_invocation.return_value = {
+            "ResponseCode": 0,
+            "StandardOutputContent": "test output",
+            "StandardErrorContent": "",
+        }
+        mock_waiter = Mock()
+        mock_clients["ssm_client"].get_waiter.return_value = mock_waiter
+
+        # Mock EC2 responses for starting the host
+        mock_clients["ec2_client"].run_instances.return_value = {
+            "Instances": [{"InstanceId": "i-1234567890abcdef0"}]
+        }
+        mock_ec2_waiter = Mock()
+        mock_clients["ec2_client"].get_waiter.return_value = mock_ec2_waiter
+
+        host = PosixEC2WorkerHost(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        host.start()
+        host.send_command("echo 'test'")
+
+        # Verify that the command was called with safety flags prepended
+        mock_clients["ssm_client"].send_command.assert_called_once()
+        call_args = mock_clients["ssm_client"].send_command.call_args
+        sent_command = call_args[1]["Parameters"]["commands"][0]
+        assert sent_command.startswith("set -eou pipefail; ")
+        assert "echo 'test'" in sent_command
+
+
+class TestEC2WorkerHostPropertyTests:
+    """Property-based tests for EC2WorkerHost interface completeness."""
+
+    @pytest.mark.parametrize(
+        "host_class,operating_system",
+        [
+            (WindowsEC2WorkerHost, "windows"),
+            (PosixEC2WorkerHost, "posix"),
+        ],
+    )
+    def test_property_14_worker_host_interface_completeness(
+        self, host_class, operating_system: str
+    ):
+        """
+        **Feature: worker-host-decoupling, Property 14: WorkerHost interface completeness**
+
+        For any WorkerHost implementation, the interface should provide methods for
+        starting the host, stopping the host, and sending commands to the host.
+
+        **Validates: Requirements 2.1, 3.2, 4.1**
+        """
+        # Create mock clients
+        mock_clients = {
+            "s3_client": Mock(),
+            "ec2_client": Mock(),
+            "ssm_client": Mock(),
+        }
+
+        # Mock SSM parameter response for AMI ID
+        mock_clients["ssm_client"].get_parameters.return_value = {
+            "Parameters": [{"Value": f"ami-{operating_system}123"}]
+        }
+
+        # Mock EC2 run_instances response
+        mock_clients["ec2_client"].run_instances.return_value = {
+            "Instances": [{"InstanceId": "i-1234567890abcdef0"}]
+        }
+
+        # Mock EC2 waiter
+        mock_ec2_waiter = Mock()
+        mock_clients["ec2_client"].get_waiter.return_value = mock_ec2_waiter
+
+        # Mock SSM send_command response
+        mock_clients["ssm_client"].send_command.return_value = {
+            "Command": {"CommandId": "cmd-12345"}
+        }
+
+        # Mock SSM get_command_invocation response
+        mock_clients["ssm_client"].get_command_invocation.return_value = {
+            "ResponseCode": 0,
+            "StandardOutputContent": "test output",
+            "StandardErrorContent": "",
+        }
+
+        # Mock SSM waiter
+        mock_ssm_waiter = Mock()
+        mock_clients["ssm_client"].get_waiter.return_value = mock_ssm_waiter
+
+        # Create the WorkerHost implementation
+        host = host_class(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        # Verify the interface provides the required methods
+        assert hasattr(host, "start"), "WorkerHost must provide start() method"
+        assert hasattr(host, "stop"), "WorkerHost must provide stop() method"
+        assert hasattr(host, "send_command"), "WorkerHost must provide send_command() method"
+        assert hasattr(host, "is_running"), "WorkerHost must provide is_running() method"
+        assert hasattr(host, "state"), "WorkerHost must provide state property"
+
+        # Verify the methods work correctly
+        # 1. Test starting the host
+        assert host.state == WorkerHostState.NOT_STARTED
+        assert not host.is_running()
+
+        host.start()
+
+        assert host.state == WorkerHostState.RUNNING
+        assert host.is_running()
+
+        # 2. Test sending commands to the host
+        result = host.send_command("echo 'test'")
+        assert isinstance(result, CommandResult)
+        assert result.exit_code == 0
+        assert result.stdout == "test output"
+
+        # 3. Test stopping the host
+        host.stop()
+
+        assert host.state == WorkerHostState.STOPPED
+        assert not host.is_running()
+
+        # Verify the operating system is correctly identified
+        assert host._operating_system() == operating_system
+
+        # Verify OS-specific abstract methods are implemented
+        assert host.ami_ssm_param_name() is not None
+        assert host.ssm_document_name() is not None
+        assert host.userdata(None) is not None
+        # ebs_devices() can return None, so just verify it's callable
+        host.ebs_devices()  # Should not raise an exception

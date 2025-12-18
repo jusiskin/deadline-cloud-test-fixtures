@@ -462,3 +462,95 @@ class EC2WorkerHost(WorkerHost):
         except Exception as e:
             diagnostic_info.append(f"Failed to get instance status: {e}")
         return "\n".join(diagnostic_info)
+
+
+@dataclass
+class WindowsEC2WorkerHost(EC2WorkerHost):
+    """Windows-specific EC2 worker host."""
+
+    WIN2022_AMI_NAME: str = field(default="Windows_Server-2022-English-Full-Base", init=False)
+
+    def _operating_system(self) -> str:
+        return "windows"
+
+    def ami_ssm_param_name(self) -> str:
+        """Return the SSM parameter name for the Windows AMI."""
+        return f"/aws/service/ami-windows-latest/{self.WIN2022_AMI_NAME}"
+
+    def ssm_document_name(self) -> str:
+        return "AWS-RunPowerShellScript"
+
+    def ebs_devices(self) -> dict[str, int] | None:
+        """DeviceName -> VolumeSize (in GiBs) mapping"""
+        # defaults to 60GB to match SMF, aws gives 30GB by default
+        return {"/dev/sda1": 60}
+
+    def userdata(self, s3_files: list[tuple[str, str]] | None) -> str:
+        """Generate Windows userdata script for instance launch."""
+        copy_s3_command = ""
+
+        if s3_files:
+            copy_s3_command = " ; ".join([f"aws s3 cp {s3_uri} {dst}" for s3_uri, dst in s3_files])
+
+        userdata = f"""<powershell>
+$ProgressPreference = 'SilentlyContinue'
+Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" -OutFile "C:\\python-3.12.10-amd64.exe"
+$installerHash=(Get-FileHash "C:\\python-3.12.10-amd64.exe" -Algorithm "MD5")
+$expectedHash="5eddb0b6f12c852725de071ae681dde4"
+if ($installerHash.Hash -ne $expectedHash) {{ throw "Could not verify Python installer." }}
+Start-Process -FilePath "C:\\python-3.12.10-amd64.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 AppendPath=1" -Wait
+Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -Outfile "C:\\AWSCLIV2.msi"
+Start-Process msiexec.exe -ArgumentList "/i C:\\AWSCLIV2.msi /quiet" -Wait
+$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine")
+{copy_s3_command}
+</powershell>"""
+
+        return userdata
+
+
+@dataclass
+class PosixEC2WorkerHost(EC2WorkerHost):
+    """POSIX (Linux)-specific EC2 worker host."""
+
+    AL2023_AMI_NAME: str = field(default="al2023-ami-kernel-6.1-x86_64", init=False)
+
+    def _operating_system(self) -> str:
+        return "posix"
+
+    def ami_ssm_param_name(self) -> str:
+        """Return the SSM parameter name for the POSIX AMI."""
+        return f"/aws/service/ami-amazon-linux-latest/{self.AL2023_AMI_NAME}"
+
+    def ssm_document_name(self) -> str:
+        return "AWS-RunShellScript"
+
+    def ebs_devices(self) -> dict[str, int] | None:
+        """DeviceName -> VolumeSize (in GiBs) mapping"""
+        # defaults to 30GB to match SMF, aws gives 8GB by default
+        return {"/dev/xvda": 30}
+
+    def send_command(
+        self, command: str, ssm_waiter_config: dict[str, int] = DEFAULT_WAITER_CONFIG
+    ) -> CommandResult:
+        """Send a command to the POSIX host, prepending bash safety flags."""
+        return super().send_command("set -eou pipefail; " + command, ssm_waiter_config)
+
+    def userdata(self, s3_files: list[tuple[str, str]] | None) -> str:
+        """Generate POSIX userdata script for instance launch."""
+        copy_s3_command = ""
+
+        if s3_files:
+            copy_s3_command = " && ".join(
+                [f"aws s3 cp {s3_uri} {dst} && chmod o+rx {dst}" for s3_uri, dst in s3_files]
+            )
+
+        userdata = f"""#!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+set -x
+{copy_s3_command}
+
+mkdir /opt/deadline
+python3 -m venv /opt/deadline/worker
+"""
+
+        return userdata
