@@ -2,19 +2,27 @@
 from __future__ import annotations
 
 import pytest
+from unittest.mock import Mock, patch
 
 
 from deadline_test_fixtures.deadline.worker_host import (
+    CommandResult,
+    Ec2Tag,
+    EC2WorkerHost,
+    InstanceStartupError,
+    PosixEC2WorkerHost,
+    WindowsEC2WorkerHost,
+    WorkerAgentState,
     WorkerHost,
     WorkerHostState,
-    WorkerAgentState,
-    EC2WorkerHost,
-    WindowsEC2WorkerHost,
-    PosixEC2WorkerHost,
-    Ec2Tag,
-    CommandResult,
 )
-from unittest.mock import Mock
+
+
+@pytest.fixture(autouse=True)
+def mock_sleep():
+    """Auto-use fixture to mock time.sleep in all tests to avoid delays."""
+    with patch("time.sleep"), patch("deadline_test_fixtures.util.sleep"):
+        yield
 
 
 class MockWorkerHost(WorkerHost):
@@ -309,7 +317,7 @@ class MockEC2WorkerHost(EC2WorkerHost):
         # Mock SSM get_command_invocation response
         mock_ssm_client.get_command_invocation.return_value = {
             "ResponseCode": 0,
-            "StandardOutputContent": "mock output",
+            "StandardOutputContent": "Userdata finished successfully",  # Return success by default
             "StandardErrorContent": "",
         }
 
@@ -341,6 +349,33 @@ class MockEC2WorkerHost(EC2WorkerHost):
 
     def userdata(self, s3_files: list[tuple[str, str]] | None) -> str:
         return "#!/bin/bash\necho 'test userdata'"
+
+    def userdata_success_script(self) -> str:
+        """Generate script to check userdata completion status."""
+        if self._os == "windows":
+            return f"""
+if (Test-Path "C:\\signal_user_data_finished\\success") {{
+    echo "{self.USERDATA_SUCCESS_STRING}"
+    exit 0
+}}
+if (Test-Path "C:\\signal_user_data_finished\\failed") {{
+    echo "{self.USERDATA_FAILURE_STRING}"
+    cat "C:\\signal_user_data_finished\\failed"
+    exit 0
+}}
+"""
+        else:
+            return f"""
+if [[ -f "/var/tmp/signal_user_data_finished/success" ]]; then
+    echo "{self.USERDATA_SUCCESS_STRING}"
+    exit 0
+fi
+if [[ -f "/var/tmp/signal_user_data_finished/failed" ]]; then
+    echo "{self.USERDATA_FAILURE_STRING}"
+    cat "/var/tmp/signal_user_data_finished/failed"
+    exit 0
+fi
+"""
 
     def ebs_devices(self) -> dict[str, int] | None:
         return {"/dev/xvda": 30} if self._os == "posix" else {"/dev/sda1": 60}
@@ -389,13 +424,38 @@ class TestEC2WorkerHost:
     def test_ec2_worker_host_send_command(self):
         """Test that EC2WorkerHost can send commands via SSM."""
         host = MockEC2WorkerHost()
+
+        # Mock the userdata check to return success immediately, then return mock output for subsequent commands
+        call_count = 0
+
+        def mock_get_command_invocation(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call is for userdata checking during start()
+                return {
+                    "ResponseCode": 0,
+                    "StandardOutputContent": "Userdata finished successfully",
+                    "StandardErrorContent": "",
+                }
+            else:
+                # Subsequent calls return mock output
+                return {
+                    "ResponseCode": 0,
+                    "StandardOutputContent": "mock output",
+                    "StandardErrorContent": "",
+                }
+
+        host.ssm_client.get_command_invocation.side_effect = mock_get_command_invocation
+
         host.start()
 
         result = host.send_command("echo 'test'")
 
         assert result.exit_code == 0
         assert result.stdout == "mock output"
-        host.ssm_client.send_command.assert_called_once()
+        # Should be called twice: once for userdata check, once for the test command
+        assert host.ssm_client.send_command.call_count == 2
 
 
 class TestEc2Tag:
@@ -470,6 +530,36 @@ class TestWindowsEC2WorkerHost:
         userdata = host.userdata(None)
         assert "<powershell>" in userdata
         assert "python-3.12.10-amd64.exe" in userdata
+        assert host.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME in userdata
+        assert host.SIGNAL_USER_DATA_FAILED_FILE_NAME in userdata
+
+    def test_windows_ec2_worker_host_userdata_success_script(self):
+        """Test that WindowsEC2WorkerHost generates correct userdata success script."""
+        mock_clients = {
+            "s3_client": Mock(),
+            "ec2_client": Mock(),
+            "ssm_client": Mock(),
+        }
+        mock_clients["ssm_client"].get_parameters.return_value = {
+            "Parameters": [{"Value": "ami-windows123"}]
+        }
+
+        host = WindowsEC2WorkerHost(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        script = host.userdata_success_script()
+        assert "Test-Path" in script
+        assert host.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME in script
+        assert host.SIGNAL_USER_DATA_FAILED_FILE_NAME in script
+        assert host.USERDATA_SUCCESS_STRING in script
+        assert host.USERDATA_FAILURE_STRING in script
 
 
 class TestPosixEC2WorkerHost:
@@ -525,6 +615,36 @@ class TestPosixEC2WorkerHost:
         userdata = host.userdata(None)
         assert "#!/bin/bash" in userdata
         assert "mkdir /opt/deadline" in userdata
+        assert host.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME in userdata
+        assert host.SIGNAL_USER_DATA_FAILED_FILE_NAME in userdata
+
+    def test_posix_ec2_worker_host_userdata_success_script(self):
+        """Test that PosixEC2WorkerHost generates correct userdata success script."""
+        mock_clients = {
+            "s3_client": Mock(),
+            "ec2_client": Mock(),
+            "ssm_client": Mock(),
+        }
+        mock_clients["ssm_client"].get_parameters.return_value = {
+            "Parameters": [{"Value": "ami-linux123"}]
+        }
+
+        host = PosixEC2WorkerHost(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        script = host.userdata_success_script()
+        assert "[[ -f" in script
+        assert host.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME in script
+        assert host.SIGNAL_USER_DATA_FAILED_FILE_NAME in script
+        assert host.USERDATA_SUCCESS_STRING in script
+        assert host.USERDATA_FAILURE_STRING in script
 
     def test_posix_ec2_worker_host_send_command_adds_safety_flags(self):
         """Test that PosixEC2WorkerHost adds bash safety flags to commands."""
@@ -541,11 +661,29 @@ class TestPosixEC2WorkerHost:
         mock_clients["ssm_client"].send_command.return_value = {
             "Command": {"CommandId": "cmd-12345"}
         }
-        mock_clients["ssm_client"].get_command_invocation.return_value = {
-            "ResponseCode": 0,
-            "StandardOutputContent": "test output",
-            "StandardErrorContent": "",
-        }
+
+        # Mock userdata check to return success immediately, then return test output for subsequent commands
+        call_count = 0
+
+        def mock_get_command_invocation(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call is for userdata checking during start()
+                return {
+                    "ResponseCode": 0,
+                    "StandardOutputContent": "Userdata finished successfully",
+                    "StandardErrorContent": "",
+                }
+            else:
+                # Subsequent calls return test output
+                return {
+                    "ResponseCode": 0,
+                    "StandardOutputContent": "test output",
+                    "StandardErrorContent": "",
+                }
+
+        mock_clients["ssm_client"].get_command_invocation.side_effect = mock_get_command_invocation
         mock_waiter = Mock()
         mock_clients["ssm_client"].get_waiter.return_value = mock_waiter
 
@@ -570,15 +708,148 @@ class TestPosixEC2WorkerHost:
         host.send_command("echo 'test'")
 
         # Verify that the command was called with safety flags prepended
-        mock_clients["ssm_client"].send_command.assert_called_once()
-        call_args = mock_clients["ssm_client"].send_command.call_args
-        sent_command = call_args[1]["Parameters"]["commands"][0]
-        assert sent_command.startswith("set -eou pipefail; ")
+        # Should be called twice: once for userdata check, once for the test command
+        assert mock_clients["ssm_client"].send_command.call_count == 2
+
+        # Check the second call (the test command) has safety flags
+        second_call_args = mock_clients["ssm_client"].send_command.call_args_list[1]
+        sent_command = second_call_args[1]["Parameters"]["commands"][0]
+        assert sent_command.startswith("set -euxo pipefail; ")
         assert "echo 'test'" in sent_command
 
 
 class TestEC2WorkerHostPropertyTests:
     """Property-based tests for EC2WorkerHost interface completeness."""
+
+    @pytest.mark.parametrize(
+        "host_class,operating_system",
+        [
+            (WindowsEC2WorkerHost, "windows"),
+            (PosixEC2WorkerHost, "posix"),
+        ],
+    )
+    @pytest.mark.timeout(30)  # Prevent test from hanging
+    def test_property_2_userdata_completion_validation(self, host_class, operating_system: str):
+        """
+        **Feature: worker-host-decoupling, Property 2: Userdata completion validation**
+
+        For any EC2 worker host, starting the worker host should wait for userdata to
+        complete successfully and raise a WorkerHostError if userdata fails or times out.
+        The raised error should include userdata execution logs.
+
+        **Validates: Requirements 2.1, 6.1**
+        """
+
+        # Create mock clients
+        mock_clients = {
+            "s3_client": Mock(),
+            "ec2_client": Mock(),
+            "ssm_client": Mock(),
+        }
+
+        # Mock SSM parameter response for AMI ID
+        mock_clients["ssm_client"].get_parameters.return_value = {
+            "Parameters": [{"Value": f"ami-{operating_system}123"}]
+        }
+
+        # Mock EC2 run_instances response
+        mock_clients["ec2_client"].run_instances.return_value = {
+            "Instances": [{"InstanceId": "i-1234567890abcdef0"}]
+        }
+
+        # Mock EC2 waiter
+        mock_ec2_waiter = Mock()
+        mock_clients["ec2_client"].get_waiter.return_value = mock_ec2_waiter
+
+        # Test Case 1: Userdata completes successfully
+        # Create the WorkerHost implementation
+        host = host_class(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        # Mock SSM send_command to return success signal
+        mock_clients["ssm_client"].send_command.return_value = {
+            "Command": {"CommandId": "cmd-success"}
+        }
+        mock_clients["ssm_client"].get_command_invocation.return_value = {
+            "ResponseCode": 0,
+            "StandardOutputContent": host.USERDATA_SUCCESS_STRING,
+            "StandardErrorContent": "",
+        }
+        mock_ssm_waiter = Mock()
+        mock_clients["ssm_client"].get_waiter.return_value = mock_ssm_waiter
+
+        # Starting should succeed when userdata completes successfully
+        host.start()
+        assert host.state == WorkerHostState.RUNNING
+        assert host.is_running()
+
+        # Reset for next test
+        host.stop()
+
+        # Test Case 2: Userdata fails
+        # Create a new host instance for the failure test
+        host_fail = host_class(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        # Mock SSM send_command to return failure signal
+        mock_clients["ssm_client"].get_command_invocation.return_value = {
+            "ResponseCode": 0,
+            "StandardOutputContent": f"{host_fail.USERDATA_FAILURE_STRING}\nError: Python installation failed",
+            "StandardErrorContent": "",
+        }
+
+        # Starting should raise InstanceStartupError when userdata fails
+        with pytest.raises(InstanceStartupError) as exc_info:
+            host_fail.start()
+
+        # Verify the error includes diagnostic information
+        error_message = str(exc_info.value)
+        assert "Userdata failed" in error_message
+        assert "DIAGNOSTICS" in error_message
+        assert "Python installation failed" in error_message
+
+        # Test Case 3: Userdata timeout (neither success nor failure detected)
+        # Create a new host instance for the timeout test
+        host_timeout = host_class(
+            subnet_id="subnet-12345",
+            security_group_id="sg-12345",
+            instance_profile_name="test-profile",
+            bootstrap_bucket_name="test-bucket",
+            instance_type="t3.micro",
+            instance_shutdown_behavior="terminate",
+            **mock_clients,
+        )
+
+        # Mock SSM send_command to return neither success nor failure
+        mock_clients["ssm_client"].get_command_invocation.return_value = {
+            "ResponseCode": 0,
+            "StandardOutputContent": "Still running userdata...",
+            "StandardErrorContent": "",
+        }
+
+        # Starting should raise InstanceStartupError on timeout
+        # (time.sleep is mocked by autouse fixture, so this will complete quickly)
+        with pytest.raises(InstanceStartupError) as exc_info:
+            host_timeout.start()
+
+        # Verify the error indicates timeout
+        error_message = str(exc_info.value)
+        assert "Timeout waiting for userdata" in error_message
+        assert "did not complete within" in error_message
 
     @pytest.mark.parametrize(
         "host_class,operating_system",
@@ -625,11 +896,28 @@ class TestEC2WorkerHostPropertyTests:
         }
 
         # Mock SSM get_command_invocation response
-        mock_clients["ssm_client"].get_command_invocation.return_value = {
-            "ResponseCode": 0,
-            "StandardOutputContent": "test output",
-            "StandardErrorContent": "",
-        }
+        # Mock userdata check to return success immediately, then return test output for subsequent commands
+        call_count = 0
+
+        def mock_get_command_invocation(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call is for userdata checking during start()
+                return {
+                    "ResponseCode": 0,
+                    "StandardOutputContent": f"ami-{operating_system}123 Userdata finished successfully",
+                    "StandardErrorContent": "",
+                }
+            else:
+                # Subsequent calls return test output
+                return {
+                    "ResponseCode": 0,
+                    "StandardOutputContent": "test output",
+                    "StandardErrorContent": "",
+                }
+
+        mock_clients["ssm_client"].get_command_invocation.side_effect = mock_get_command_invocation
 
         # Mock SSM waiter
         mock_ssm_waiter = Mock()

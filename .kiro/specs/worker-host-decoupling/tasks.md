@@ -41,7 +41,7 @@
   - **Simultaneously ensure all existing tests continue to pass**
   - _Requirements: 7.1, 7.2, 7.3, 7.4_
 
-- [ ] 3.1 Implement userdata success checking in WorkerHost and add property test
+- [x] 3.1 Implement userdata success checking in WorkerHost and add property test
   - Add `userdata_success_script()` abstract method to `EC2WorkerHost`
   - Add `_wait_until_userdata_finishes()` method to `EC2WorkerHost`
   - Add userdata success/failure constants to `EC2WorkerHost`

@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Optional
 
 
-from ..util import call_api, retry_with_predicate, is_instance_not_ready
+from ..util import call_api, retry_with_predicate, is_instance_not_ready, wait_for
 
 LOG = logging.getLogger(__name__)
 
@@ -209,6 +209,10 @@ class EC2WorkerHost(WorkerHost):
     instance_id: Optional[str] = field(init=False, default=None)
     override_ami_id: InitVar[Optional[str]] = None
 
+    # Userdata success/failure constants
+    USERDATA_SUCCESS_STRING: str = field(default="Userdata finished successfully", init=False)
+    USERDATA_FAILURE_STRING: str = field(default="Userdata failed to finish", init=False)
+
     def __post_init__(self, override_ami_id: Optional[str] = None):
         super().__init__()
         if override_ami_id:
@@ -234,6 +238,11 @@ class EC2WorkerHost(WorkerHost):
         """Return EBS device mappings."""
         pass
 
+    @abc.abstractmethod
+    def userdata_success_script(self) -> str:
+        """Generate script to check if userdata finished successfully."""
+        pass
+
     @property
     def ami_id(self) -> str:
         """Get the AMI ID, resolving from SSM parameter if needed."""
@@ -253,8 +262,129 @@ class EC2WorkerHost(WorkerHost):
         return self._ami_id
 
     def _do_start(self) -> None:
-        """Start the EC2 instance."""
+        """Start the EC2 instance and wait for userdata to complete."""
         self._launch_instance()
+        # Temporarily set state to RUNNING so send_command works during userdata check
+        self._state = WorkerHostState.RUNNING
+        try:
+            self._wait_until_userdata_finishes()
+        except Exception:
+            # If userdata fails, reset state to NOT_STARTED
+            self._state = WorkerHostState.NOT_STARTED
+            raise
+
+    def _wait_until_userdata_finishes(self) -> None:
+        """Wait for userdata to complete successfully."""
+        if not self.instance_id:
+            raise RuntimeError("Cannot wait for userdata: no instance ID available")
+
+        result: Optional[CommandResult] = None
+        success: bool = False
+        LOG.info("Waiting for userdata to finish")
+
+        def get_userdata_result() -> bool:
+            nonlocal result
+            nonlocal success
+            result = self.send_command(self.userdata_success_script())
+
+            if self.USERDATA_SUCCESS_STRING in str(result):
+                success = True
+                return True
+
+            if self.USERDATA_FAILURE_STRING in str(result):
+                success = False
+                return True
+
+            return False
+
+        try:
+            # Raises TimeoutError if the userdata status cannot be fetched in
+            # the given timeframe.
+            wait_for(
+                description="getting the result of userdata",
+                predicate=get_userdata_result,
+                interval_s=5,
+                max_retries=60,
+            )
+        except TimeoutError as e:
+            raise InstanceStartupError(
+                message=f"Timeout waiting for userdata to complete on instance {self.instance_id}",
+                diagnostics="Userdata did not complete within 300 seconds (60 retries × 5s intervals)",
+            ) from e
+
+        if not success:
+            # Userdata failed - include the failure details in the error
+            failure_details = str(result) if result else "No result available"
+            raise InstanceStartupError(
+                message=f"Userdata failed on instance {self.instance_id}",
+                diagnostics=f"Userdata failure details:\n{failure_details}",
+            )
+
+        LOG.info("Userdata finished successfully.")
+
+    @retry_with_predicate(
+        max_attempts=3, predicate=lambda e: isinstance(e, botocore.exceptions.WaiterError)
+    )
+    @retry_with_predicate(max_attempts=60, delay=10, backoff=1, predicate=is_instance_not_ready)
+    def _send_command_internal(
+        self, command: str, ssm_waiter_config: dict[str, int] = DEFAULT_WAITER_CONFIG
+    ) -> CommandResult:
+        """Send a command via SSM without checking if host is running (for internal use during startup)."""
+        if not self.instance_id:
+            raise RuntimeError("No instance ID available")
+
+        ssm_waiter = self.ssm_client.get_waiter("command_executed")
+
+        LOG.info(f"Sending SSM command to instance {self.instance_id}")
+        try:
+            send_command_response = self.ssm_client.send_command(
+                InstanceIds=[self.instance_id],
+                DocumentName=self.ssm_document_name(),
+                Parameters={"commands": [command]},
+            )
+        except botocore.exceptions.ClientError as error:
+            if error.response["Error"]["Code"] == "InvalidInstanceId":
+                LOG.warning(
+                    f"Instance {self.instance_id} is not ready for SSM command (received InvalidInstanceId error)."
+                )
+            raise
+
+        command_id = send_command_response["Command"]["CommandId"]
+
+        LOG.info(f"Waiting for SSM command {command_id} to reach a terminal state")
+        try:
+            ssm_waiter.wait(
+                InstanceId=self.instance_id,
+                CommandId=command_id,
+                WaiterConfig=ssm_waiter_config,
+            )
+        except botocore.exceptions.WaiterError as e:
+            LOG.warning(f"WaiterError caught for command {command_id}:")
+            LOG.warning(f"\tError reason: {str(e)}")
+            LOG.warning(f"\tWaiter last response: {str(e.last_response)}")
+
+            if isinstance(e, botocore.exceptions.WaiterError) and (
+                "Undeliverable" in str(e) or "Undeliverable" in str(e.last_response)
+            ):
+                LOG.warning(
+                    f"Unable to deliver command {command_id} to instance {self.instance_id} (received UndeliverableError)."
+                )
+                raise e
+
+        ssm_command_result = self.ssm_client.get_command_invocation(
+            InstanceId=self.instance_id,
+            CommandId=command_id,
+        )
+        result = CommandResult(
+            exit_code=ssm_command_result["ResponseCode"],
+            stdout=ssm_command_result["StandardOutputContent"],
+            stderr=ssm_command_result["StandardErrorContent"],
+        )
+        if result.exit_code == -1:
+            LOG.error(f"Failed to send SSM command {command_id} to {self.instance_id}: {result}")
+
+        LOG.info(f"SSM command {command_id} completed with exit code: {result.exit_code}")
+        return result
 
     def _do_stop(self) -> None:
         """Stop the EC2 instance and clean up resources."""
@@ -470,6 +600,17 @@ class WindowsEC2WorkerHost(EC2WorkerHost):
 
     WIN2022_AMI_NAME: str = field(default="Windows_Server-2022-English-Full-Base", init=False)
 
+    # Windows-specific userdata signaling paths
+    SIGNAL_USER_DATA_DIR: str = field(default="C:\\signal_user_data_finished", init=False)
+    SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME: str = field(init=False)
+    SIGNAL_USER_DATA_FAILED_FILE_NAME: str = field(init=False)
+
+    def __post_init__(self, override_ami_id: Optional[str] = None):
+        super().__post_init__(override_ami_id)
+        # Initialize signal file paths after SIGNAL_USER_DATA_DIR is set
+        self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME = f"{self.SIGNAL_USER_DATA_DIR}\\success"
+        self.SIGNAL_USER_DATA_FAILED_FILE_NAME = f"{self.SIGNAL_USER_DATA_DIR}\\failed"
+
     def _operating_system(self) -> str:
         return "windows"
 
@@ -485,6 +626,23 @@ class WindowsEC2WorkerHost(EC2WorkerHost):
         # defaults to 60GB to match SMF, aws gives 30GB by default
         return {"/dev/sda1": 60}
 
+    def userdata_success_script(self) -> str:
+        """Generate PowerShell script to check userdata completion status."""
+        return f"""
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+Set-PSDebug -Trace 1
+if (Test-Path "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME}") {{
+    echo "{self.USERDATA_SUCCESS_STRING}"
+    exit 0
+}}
+if (Test-Path "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}") {{
+    echo "{self.USERDATA_FAILURE_STRING}"
+    cat "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}"
+    exit 0
+}}
+"""
+
     def userdata(self, s3_files: list[tuple[str, str]] | None) -> str:
         """Generate Windows userdata script for instance launch."""
         copy_s3_command = ""
@@ -493,16 +651,30 @@ class WindowsEC2WorkerHost(EC2WorkerHost):
             copy_s3_command = " ; ".join([f"aws s3 cp {s3_uri} {dst}" for s3_uri, dst in s3_files])
 
         userdata = f"""<powershell>
-$ProgressPreference = 'SilentlyContinue'
-Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" -OutFile "C:\\python-3.12.10-amd64.exe"
-$installerHash=(Get-FileHash "C:\\python-3.12.10-amd64.exe" -Algorithm "MD5")
-$expectedHash="5eddb0b6f12c852725de071ae681dde4"
-if ($installerHash.Hash -ne $expectedHash) {{ throw "Could not verify Python installer." }}
-Start-Process -FilePath "C:\\python-3.12.10-amd64.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 AppendPath=1" -Wait
-Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -Outfile "C:\\AWSCLIV2.msi"
-Start-Process msiexec.exe -ArgumentList "/i C:\\AWSCLIV2.msi /quiet" -Wait
-$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine")
-{copy_s3_command}
+try {{
+    $ProgressPreference = 'SilentlyContinue'
+    
+    # Create signal directory
+    New-Item -ItemType Directory -Force -Path "{self.SIGNAL_USER_DATA_DIR}"
+    
+    Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" -OutFile "C:\\python-3.12.10-amd64.exe"
+    $installerHash=(Get-FileHash "C:\\python-3.12.10-amd64.exe" -Algorithm "MD5")
+    $expectedHash="5eddb0b6f12c852725de071ae681dde4"
+    if ($installerHash.Hash -ne $expectedHash) {{ throw "Could not verify Python installer." }}
+    Start-Process -FilePath "C:\\python-3.12.10-amd64.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 AppendPath=1" -Wait
+    Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -Outfile "C:\\AWSCLIV2.msi"
+    Start-Process msiexec.exe -ArgumentList "/i C:\\AWSCLIV2.msi /quiet" -Wait
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine")
+    {copy_s3_command}
+    
+    # Signal success
+    "Userdata completed successfully" | Out-File -FilePath "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME}" -Encoding UTF8
+}} catch {{
+    # Signal failure with error details
+    $errorMessage = "Userdata failed: $($_.Exception.Message)`nStack trace: $($_.ScriptStackTrace)"
+    $errorMessage | Out-File -FilePath "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}" -Encoding UTF8
+    throw
+}}
 </powershell>"""
 
         return userdata
@@ -513,6 +685,19 @@ class PosixEC2WorkerHost(EC2WorkerHost):
     """POSIX (Linux)-specific EC2 worker host."""
 
     AL2023_AMI_NAME: str = field(default="al2023-ami-kernel-6.1-x86_64", init=False)
+
+    # POSIX-specific userdata signaling paths
+    SIGNAL_USER_DATA_SUCCESS_DIR: str = field(
+        default="/var/tmp/signal_user_data_finished", init=False
+    )
+    SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME: str = field(init=False)
+    SIGNAL_USER_DATA_FAILED_FILE_NAME: str = field(init=False)
+
+    def __post_init__(self, override_ami_id: Optional[str] = None):
+        super().__post_init__(override_ami_id)
+        # Initialize signal file paths after SIGNAL_USER_DATA_SUCCESS_DIR is set
+        self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME = f"{self.SIGNAL_USER_DATA_SUCCESS_DIR}/success"
+        self.SIGNAL_USER_DATA_FAILED_FILE_NAME = f"{self.SIGNAL_USER_DATA_SUCCESS_DIR}/failed"
 
     def _operating_system(self) -> str:
         return "posix"
@@ -533,7 +718,27 @@ class PosixEC2WorkerHost(EC2WorkerHost):
         self, command: str, ssm_waiter_config: dict[str, int] = DEFAULT_WAITER_CONFIG
     ) -> CommandResult:
         """Send a command to the POSIX host, prepending bash safety flags."""
-        return super().send_command("set -eou pipefail; " + command, ssm_waiter_config)
+        return super().send_command("set -euxo pipefail; " + command, ssm_waiter_config)
+
+    def _send_command_internal(
+        self, command: str, ssm_waiter_config: dict[str, int] = DEFAULT_WAITER_CONFIG
+    ) -> CommandResult:
+        """Send a command to the POSIX host internally, prepending bash safety flags."""
+        return super()._send_command_internal("set -euxo pipefail; " + command, ssm_waiter_config)
+
+    def userdata_success_script(self) -> str:
+        """Generate bash script to check userdata completion status."""
+        return f"""
+if [[ -f "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME}" ]]; then
+    echo "{self.USERDATA_SUCCESS_STRING}"
+    exit 0
+fi
+if [[ -f "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}" ]]; then
+    echo "{self.USERDATA_FAILURE_STRING}"
+    cat "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}"
+    exit 0
+fi
+"""
 
     def userdata(self, s3_files: list[tuple[str, str]] | None) -> str:
         """Generate POSIX userdata script for instance launch."""
@@ -547,10 +752,20 @@ class PosixEC2WorkerHost(EC2WorkerHost):
         userdata = f"""#!/bin/bash
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 set -x
+
+# Create signal directory
+mkdir -p "{self.SIGNAL_USER_DATA_SUCCESS_DIR}"
+
+# Trap to signal failure on any error
+trap 'echo "Userdata failed at line $LINENO: $BASH_COMMAND" > "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}"; exit 1' ERR
+
 {copy_s3_command}
 
 mkdir /opt/deadline
 python3 -m venv /opt/deadline/worker
+
+# Signal success
+echo "Userdata completed successfully" > "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME}"
 """
 
         return userdata
