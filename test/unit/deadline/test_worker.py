@@ -5,7 +5,7 @@ import pathlib
 import re
 import subprocess
 from typing import Any, Generator
-from unittest.mock import ANY, MagicMock, call, mock_open, patch
+from unittest.mock import ANY, MagicMock, mock_open, patch
 
 import boto3
 import pytest
@@ -23,6 +23,7 @@ from deadline_test_fixtures import (
     PosixInstanceBuildWorker,
     S3Object,
 )
+from deadline_test_fixtures.deadline.worker_host import PosixEC2WorkerHost
 from deadline_test_fixtures.deadline import worker as mod
 
 
@@ -142,26 +143,45 @@ class TestPosixInstanceBuildWorker:
         return name
 
     @pytest.fixture
-    def worker(
+    def worker_host(
         self,
-        worker_config: DeadlineWorkerConfiguration,
         subnet_id: str,
         security_group_id: str,
         instance_profile_name: str,
         bootstrap_bucket_name: str,
+    ) -> MagicMock:
+        # Create a mock worker host for testing
+        mock_host = MagicMock(spec=PosixEC2WorkerHost)
+        mock_host.subnet_id = subnet_id
+        mock_host.security_group_id = security_group_id
+        mock_host.instance_profile_name = instance_profile_name
+        mock_host.bootstrap_bucket_name = bootstrap_bucket_name
+        mock_host.s3_client = boto3.client("s3")
+        mock_host.ec2_client = boto3.client("ec2")
+        mock_host.ssm_client = boto3.client("ssm")
+        mock_host.instance_type = "t3.micro"
+        mock_host.instance_shutdown_behavior = "terminate"
+        mock_host.additional_tags = []
+        mock_host.instance_id = "i-1234567890abcdef0"
+        mock_host.ami_id = "ami-1234567890abcdef0"
+        mock_host.is_running.return_value = True
+        mock_host._operating_system.return_value = "posix"
+        # Explicitly create MagicMock instances for these methods
+        mock_host._claim_for_worker = MagicMock(name="_claim_for_worker")
+        mock_host._release_from_worker = MagicMock(name="_release_from_worker")
+        mock_host.send_command = MagicMock(name="send_command")
+        return mock_host
+
+    @pytest.fixture
+    def worker(
+        self,
+        worker_config: DeadlineWorkerConfiguration,
+        worker_host: MagicMock,
     ) -> PosixInstanceBuildWorker:
         return PosixInstanceBuildWorker(
-            subnet_id=subnet_id,
-            security_group_id=security_group_id,
-            instance_profile_name=instance_profile_name,
-            bootstrap_bucket_name=bootstrap_bucket_name,
-            s3_client=boto3.client("s3"),
-            ec2_client=boto3.client("ec2"),
-            ssm_client=boto3.client("ssm"),
-            deadline_client=boto3.client("deadline"),
             configuration=worker_config,
-            instance_type="t3.micro",
-            instance_shutdown_behavior="terminate",
+            worker_host=worker_host,
+            deadline_client=boto3.client("deadline"),
         )
 
     @patch.object(mod, "open", mock_open(read_data="mock data".encode()))
@@ -172,19 +192,16 @@ class TestPosixInstanceBuildWorker:
             ("s3://bucket/tmp/file", "/tmp/file"),
         ]
         with (
+            patch.object(worker.worker_host, "is_running", return_value=True),
             patch.object(worker, "_stage_s3_bucket", return_value=s3_files) as mock_stage_s3_bucket,
-            patch.object(worker, "_launch_instance") as mock_launch_instance,
-            patch.object(worker, "_setup_worker_agent") as mock_setup_worker_agent,
-            patch.object(
-                worker, "_wait_until_userdata_finishes", return_value=(True, "")
-            ) as mock_wait_until_userdata_finishes,
+            patch.object(worker, "_install_agent") as mock_install_agent,
+            patch.object(worker, "_configure_agent") as mock_configure_agent,
+            patch.object(worker, "_start_agent_service") as mock_start_agent_service,
             patch.object(
                 worker,
                 "get_worker_id",
-                return_value=CommandResult(
-                    exit_code=0, stdout="worker-7c3377ec9eba444bb51cc7da18463081"
-                ),
-            ),
+                return_value="worker-7c3377ec9eba444bb51cc7da18463081",
+            ) as mock_get_worker_id,
         ):
             # WHEN
             worker.start()
@@ -192,9 +209,11 @@ class TestPosixInstanceBuildWorker:
         # THEN
         # Detailed testing for each of these is done in dedicated test methods
         mock_stage_s3_bucket.assert_called_once()
-        mock_launch_instance.assert_called_once_with(s3_files=s3_files)
-        mock_setup_worker_agent.assert_called_once()
-        mock_wait_until_userdata_finishes.assert_called_once()
+        mock_install_agent.assert_called_once_with(s3_files)
+        mock_configure_agent.assert_called_once()
+        mock_start_agent_service.assert_called_once()
+        mock_get_worker_id.assert_called_once()
+        assert worker.worker_id == "worker-7c3377ec9eba444bb51cc7da18463081"
 
     @patch.object(mod, "open", mock_open(read_data="mock data".encode()))
     def test_start_userdata_successful(self, worker: PosixInstanceBuildWorker) -> None:
@@ -203,87 +222,43 @@ class TestPosixInstanceBuildWorker:
             ("s3://bucket/key", "/tmp/key"),
             ("s3://bucket/tmp/file", "/tmp/file"),
         ]
-        ssm_send_command_return_value = {
-            "Command": {
-                "CommandId": "37c7a933-5e67-4cee-a36e-12e1e3a51237",
-            }
-        }
-        ssm_get_command_invocation_return_value = {
-            "ResponseCode": 0,
-            "StandardOutputContent": PosixInstanceBuildWorker.USERDATA_SUCCESS_STRING,
-            "StandardErrorContent": "",
-        }
 
         with (
+            patch.object(worker.worker_host, "is_running", return_value=True),
             patch.object(worker, "_stage_s3_bucket", return_value=s3_files),
-            patch.object(worker, "_launch_instance"),
-            patch.object(worker, "_setup_worker_agent") as mock_setup_worker_agent,
-            patch.object(
-                worker.ssm_client, "send_command", return_value=ssm_send_command_return_value
-            ) as mock_send_command,
-            patch.object(
-                worker.ssm_client,
-                "get_command_invocation",
-                return_value=ssm_get_command_invocation_return_value,
-            ) as mock_get_command_invocation,
-            patch.object(worker.ssm_client, "get_waiter"),
+            patch.object(worker, "_install_agent") as mock_install_agent,
+            patch.object(worker, "_configure_agent") as mock_configure_agent,
+            patch.object(worker, "_start_agent_service") as mock_start_agent_service,
             patch.object(
                 worker,
                 "get_worker_id",
-                return_value=CommandResult(
-                    exit_code=0, stdout="worker-7c3377ec9eba444bb51cc7da18463081"
-                ),
+                return_value="worker-7c3377ec9eba444bb51cc7da18463081",
             ),
         ):
             # WHEN
             worker.start()
 
         # THEN
-        # Make sure we get to the end of the function and that we sent the
-        # userdata commands
-        mock_setup_worker_agent.assert_called_once()
-        mock_send_command.assert_called_once()
-        mock_get_command_invocation.assert_called_once()
+        # Make sure we get to the end of the function and that we called agent setup methods
+        mock_install_agent.assert_called_once()
+        mock_configure_agent.assert_called_once()
+        mock_start_agent_service.assert_called_once()
 
     @patch.object(mod, "open", mock_open(read_data="mock data".encode()))
     def test_start_userdata_unsuccessful(self, worker: PosixInstanceBuildWorker) -> None:
-        # GIVEN
+        # GIVEN - This test is no longer relevant since userdata is handled by WorkerHost
+        # We'll test agent configuration failure instead
         s3_files = [
             ("s3://bucket/key", "/tmp/key"),
             ("s3://bucket/tmp/file", "/tmp/file"),
         ]
-        ssm_send_command_return_value = {
-            "Command": {
-                "CommandId": "37c7a933-5e67-4cee-a36e-12e1e3a51237",
-            }
-        }
-        failure_content = (
-            f"{PosixInstanceBuildWorker.USERDATA_FAILURE_STRING}\nAWS CLI failed to install"
-        )
-        ssm_get_command_invocation_return_value = {
-            "ResponseCode": 0,
-            "StandardOutputContent": failure_content,
-            "StandardErrorContent": "",
-        }
 
         with (
+            patch.object(worker.worker_host, "is_running", return_value=True),
             patch.object(worker, "_stage_s3_bucket", return_value=s3_files),
-            patch.object(worker, "_launch_instance"),
+            patch.object(worker, "_install_agent"),
             patch.object(
-                worker.ssm_client, "send_command", return_value=ssm_send_command_return_value
-            ) as mock_send_command,
-            patch.object(
-                worker.ssm_client,
-                "get_command_invocation",
-                return_value=ssm_get_command_invocation_return_value,
-            ) as mock_get_command_invocation,
-            patch.object(worker.ssm_client, "get_waiter"),
-            patch.object(
-                worker,
-                "get_worker_id",
-                return_value=CommandResult(
-                    exit_code=0, stdout="worker-7c3377ec9eba444bb51cc7da18463081"
-                ),
+                worker, "_configure_agent", side_effect=AssertionError("Agent config failed")
             ),
             pytest.raises(AssertionError) as excinfo,
         ):
@@ -291,30 +266,24 @@ class TestPosixInstanceBuildWorker:
             worker.start()
 
         # THEN
-        # Make sure we get to the end of the function and that we sent the
-        # userdata commands
-        mock_send_command.assert_called_once()
-        mock_get_command_invocation.assert_called_once()
-        assert failure_content in str(excinfo.value)
+        assert "Agent config failed" in str(excinfo.value)
 
     @patch.object(mod, "open", mock_open(read_data="mock data".encode()))
     def test_start_userdata_timed_out(self, worker: PosixInstanceBuildWorker) -> None:
-        # GIVEN
+        # GIVEN - This test is no longer relevant since userdata is handled by WorkerHost
+        # We'll test agent startup timeout instead
         s3_files = [
             ("s3://bucket/key", "/tmp/key"),
             ("s3://bucket/tmp/file", "/tmp/file"),
         ]
 
         with (
+            patch.object(worker.worker_host, "is_running", return_value=True),
             patch.object(worker, "_stage_s3_bucket", return_value=s3_files),
-            patch.object(worker, "_launch_instance"),
-            patch.object(mod, "wait_for", side_effect=TimeoutError()),
+            patch.object(worker, "_install_agent"),
+            patch.object(worker, "_configure_agent"),
             patch.object(
-                worker,
-                "get_worker_id",
-                return_value=CommandResult(
-                    exit_code=0, stdout="worker-7c3377ec9eba444bb51cc7da18463081"
-                ),
+                worker, "_start_agent_service", side_effect=TimeoutError("Agent start timeout")
             ),
             pytest.raises(TimeoutError),
         ):
@@ -349,151 +318,90 @@ class TestPosixInstanceBuildWorker:
             s3_obj = S3Object.from_uri(s3_uri)
             s3_client.head_object(Bucket=s3_obj.bucket, Key=s3_obj.key)
 
-    def test_launch_instance(
-        self,
-        worker: PosixInstanceBuildWorker,
-        vpc_id: str,
-        subnet_id: str,
-        security_group_id: str,
-        instance_profile: Any,
-    ) -> None:
-        # WHEN
-        worker._launch_instance()
-
-        # THEN
-        assert worker.instance_id is not None
-
-        instance = TestPosixInstanceBuildWorker.describe_instance(worker.instance_id)
-        assert instance["ImageId"] == worker.ami_id
-        assert instance["State"]["Name"] == "running"
-        assert instance["SubnetId"] == subnet_id
-        assert instance["VpcId"] == vpc_id
-        assert instance["IamInstanceProfile"]["Arn"] == instance_profile["Arn"]
-        assert len(instance["SecurityGroups"]) == 1
-        assert instance["SecurityGroups"][0]["GroupId"] == security_group_id
-
-    @pytest.mark.skip(
-        "There's nothing to test in this method currently since it's just sending SSM commands"
-    )
-    def test_setup_worker_agent(self) -> None:
-        pass
-
     def test_stop(self, worker: PosixInstanceBuildWorker) -> None:
         # GIVEN
-        # WHEN
+        # Start the worker first
         with (
+            patch.object(worker.worker_host, "is_running", return_value=True),
+            patch.object(worker, "_stage_s3_bucket", return_value=None),
             patch.object(
                 worker, "get_worker_id", return_value="worker-7c3377ec9eba444bb51cc7da18463081"
             ),
-            patch.object(worker, "_wait_until_userdata_finishes", return_value=(True, "")),
+            patch.object(
+                worker, "send_command", return_value=CommandResult(exit_code=0, stdout="")
+            ),
         ):
             worker.start()
-        instance_id = worker.instance_id
-        assert instance_id is not None
 
-        instance = TestPosixInstanceBuildWorker.describe_instance(instance_id)
-        assert instance["State"]["Name"] == "running"
-
-        worker.stop()
+        # Mock the cleanup methods
+        with (
+            patch.object(worker, "_stop_agent_service") as mock_stop_service,
+            patch.object(worker, "_cleanup_agent_state") as mock_cleanup_state,
+            patch.object(worker, "_delete_worker") as mock_delete_worker,
+        ):
+            # WHEN
+            worker.stop()
 
         # THEN
-        instance = TestPosixInstanceBuildWorker.describe_instance(instance_id)
-        assert instance["State"]["Name"] == "terminated"
-        assert worker.instance_id is None
+        mock_stop_service.assert_called_once()
+        mock_cleanup_state.assert_called_once()
+        mock_delete_worker.assert_called_once()
+        assert worker.worker_id is None
+        assert worker.agent_state.value == "not_started"
+        # Verify host was released
+        worker.worker_host._release_from_worker.assert_called_once_with(id(worker))  # type: ignore[attr-defined]
 
     class TestSendCommand:
         def test_sends_command(self, worker: PosixInstanceBuildWorker) -> None:
             # GIVEN
             cmd = 'echo "Hello world"'
-            # WHEN
-            with (
-                patch.object(
-                    worker, "get_worker_id", return_value="worker-7c3377ec9eba444bb51cc7da18463081"
-                ),
-                patch.object(worker, "_wait_until_userdata_finishes", return_value=(True, "")),
-            ):
-                worker.start()
+            expected_result = CommandResult(exit_code=0, stdout="Hello world")
+
+            # Mock the worker host send_command method
+            worker.worker_host.send_command.return_value = expected_result
 
             # WHEN
-            with patch.object(
-                worker.ssm_client, "send_command", wraps=worker.ssm_client.send_command
-            ) as send_command_spy:
-                worker.send_command(cmd)
+            result = worker.send_command(cmd)
 
             # THEN
-            send_command_spy.assert_called_once_with(
-                InstanceIds=[worker.instance_id],
-                DocumentName="AWS-RunShellScript",
-                Parameters={"commands": ["set -euxo pipefail; " + cmd]},
+            worker.worker_host.send_command.assert_called_once_with(
+                cmd, {"Delay": 5, "MaxAttempts": 30}
             )
+            assert result == expected_result
 
         def test_retries_when_instance_not_ready(self, worker: PosixInstanceBuildWorker) -> None:
             # GIVEN
             cmd = 'echo "Hello world"'
-            # WHEN
-            with (
-                patch.object(
-                    worker, "get_worker_id", return_value="worker-7c3377ec9eba444bb51cc7da18463081"
-                ),
-                patch.object(worker, "_wait_until_userdata_finishes", return_value=(True, "")),
-            ):
-                worker.start()
-            real_send_command = worker.ssm_client.send_command
+            expected_result = CommandResult(exit_code=0, stdout="Hello world")
 
-            call_count = 0
-
-            def side_effect(*args, **kwargs):
-                nonlocal call_count
-                if call_count < 1:
-                    call_count += 1
-                    raise ClientError({"Error": {"Code": "InvalidInstanceId"}}, "SendCommand")
-                else:
-                    return real_send_command(*args, **kwargs)
+            # Mock retry behavior in worker host - the worker just delegates to host
+            # so the host should handle retries, not the worker
+            worker.worker_host.send_command.return_value = expected_result
 
             # WHEN
-            with patch.object(
-                worker.ssm_client, "send_command", side_effect=side_effect
-            ) as mock_send_command:
-                worker.send_command(cmd)
+            result = worker.send_command(cmd)
 
             # THEN
-            mock_send_command.assert_has_calls(
-                [
-                    call(
-                        InstanceIds=[worker.instance_id],
-                        DocumentName="AWS-RunShellScript",
-                        Parameters={"commands": ["set -euxo pipefail; " + cmd]},
-                    )
-                ]
-                * 2
+            assert result == expected_result
+            # Worker should delegate to host with default waiter config
+            worker.worker_host.send_command.assert_called_once_with(
+                cmd, {"Delay": 5, "MaxAttempts": 30}
             )
 
         def test_raises_any_other_error(self, worker: PosixInstanceBuildWorker) -> None:
             # GIVEN
             cmd = 'echo "Hello world"'
-            # WHEN
-            with (
-                patch.object(
-                    worker, "get_worker_id", return_value="worker-7c3377ec9eba444bb51cc7da18463081"
-                ),
-                patch.object(worker, "_wait_until_userdata_finishes", return_value=(True, "")),
-            ):
-                worker.start()
             err = ClientError({"Error": {"Code": "SomethingWentWrong"}}, "SendCommand")
 
-            # WHEN
-            with pytest.raises(ClientError) as raised_err:
-                with patch.object(
-                    worker.ssm_client, "send_command", side_effect=err
-                ) as mock_send_command:
-                    worker.send_command(cmd)
+            worker.worker_host.send_command.side_effect = err
 
-            # THEN
+            # WHEN / THEN
+            with pytest.raises(ClientError) as raised_err:
+                worker.send_command(cmd)
+
             assert raised_err.value is err
-            mock_send_command.assert_called_once_with(
-                InstanceIds=[worker.instance_id],
-                DocumentName="AWS-RunShellScript",
-                Parameters={"commands": ["set -euxo pipefail; " + cmd]},
+            worker.worker_host.send_command.assert_called_once_with(
+                cmd, {"Delay": 5, "MaxAttempts": 30}
             )
 
     @pytest.mark.parametrize(
@@ -516,8 +424,10 @@ class TestPosixInstanceBuildWorker:
         assert result == worker_id.rstrip("\n\r")
 
     def test_ami_id(self, worker: PosixInstanceBuildWorker) -> None:
+        # GIVEN
+        # The ami_id is already set in the fixture
         # WHEN
-        ami_id = worker.ami_id
+        ami_id = worker.worker_host.ami_id
 
         # THEN
         assert re.match(r"^ami-[0-9a-f]{17}$", ami_id)

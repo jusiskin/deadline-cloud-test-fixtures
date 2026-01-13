@@ -24,8 +24,8 @@ from ..models import (
     PosixSessionUser,
 )
 from .resources import CloudWatchLogEvent, Fleet, WorkerLog
-from .worker_host import Ec2Tag, CommandResult
-from ..util import call_api, wait_for, retry_with_predicate, is_instance_not_ready
+from .worker_host import Ec2Tag, CommandResult, EC2WorkerHost, WorkerAgentState
+from ..util import call_api, wait_for
 
 if TYPE_CHECKING:
     from botocore.paginate import PageIterator, Paginator
@@ -133,23 +133,40 @@ class DeadlineWorkerConfiguration:
 
 @dataclass
 class EC2InstanceWorker(DeadlineWorker):
-    subnet_id: str
-    security_group_id: str
-    instance_profile_name: str
-    bootstrap_bucket_name: str
-    s3_client: botocore.client.BaseClient
-    ec2_client: botocore.client.BaseClient
-    ssm_client: botocore.client.BaseClient
-    deadline_client: botocore.client.BaseClient
+    """
+    EC2-based worker with composed WorkerHost.
+
+    Args:
+        configuration: Worker agent configuration (farm, fleet, region, etc.)
+        worker_host: The EC2 worker host to use (required)
+
+    Example:
+        >>> host = WindowsEC2WorkerHost(subnet_id="...", ...)
+        >>> host.start()
+        >>> worker = WindowsInstanceBuildWorker(configuration=config, worker_host=host)
+        >>> worker.start()
+        >>> # Use worker...
+        >>> worker.stop()
+        >>> # Host is still running and can be reused
+    """
+
     configuration: DeadlineWorkerConfiguration
-
-    instance_type: str
-    instance_shutdown_behavior: str
-
-    additional_tags: list[Ec2Tag] = field(default_factory=list)
-
-    instance_id: Optional[str] = field(init=False, default=None)
+    worker_host: EC2WorkerHost
+    deadline_client: botocore.client.BaseClient
     worker_id: Optional[str] = field(init=False, default=None)
+    _agent_state: WorkerAgentState = field(init=False, default=WorkerAgentState.NOT_STARTED)
+
+    # Legacy fields for backward compatibility - will be removed in future tasks
+    subnet_id: str = field(init=False)
+    security_group_id: str = field(init=False)
+    instance_profile_name: str = field(init=False)
+    bootstrap_bucket_name: str = field(init=False)
+    s3_client: botocore.client.BaseClient = field(init=False)
+    ec2_client: botocore.client.BaseClient = field(init=False)
+    ssm_client: botocore.client.BaseClient = field(init=False)
+    instance_type: str = field(init=False)
+    instance_shutdown_behavior: str = field(init=False)
+    additional_tags: list[Ec2Tag] = field(init=False, default_factory=list)
 
     USERDATA_SUCCESS_STRING: ClassVar[str] = "Userdata finished successfully"
     USERDATA_FAILURE_STRING: ClassVar[str] = "Userdata failed to finish"
@@ -160,8 +177,46 @@ class EC2InstanceWorker(DeadlineWorker):
     override_ami_id: InitVar[Optional[str]] = None
 
     def __post_init__(self, override_ami_id: Optional[str] = None):
+        """Initialize the worker and validate operating system compatibility."""
+        # Validate that the worker host OS matches the worker requirements
+        required_os = self._required_host_os()
+        host_os = self.worker_host._operating_system()
+        if required_os != host_os:
+            raise ValueError(
+                f"Worker requires {required_os} host but got {host_os} host. "
+                f"Ensure you use the correct WorkerHost type for this worker."
+            )
+
+        # Set legacy fields from worker_host for backward compatibility
+        self.subnet_id = self.worker_host.subnet_id
+        self.security_group_id = self.worker_host.security_group_id
+        self.instance_profile_name = self.worker_host.instance_profile_name
+        self.bootstrap_bucket_name = self.worker_host.bootstrap_bucket_name
+        self.s3_client = self.worker_host.s3_client
+        self.ec2_client = self.worker_host.ec2_client
+        self.ssm_client = self.worker_host.ssm_client
+        self.instance_type = self.worker_host.instance_type
+        self.instance_shutdown_behavior = self.worker_host.instance_shutdown_behavior
+        self.additional_tags = self.worker_host.additional_tags
+        self.additional_tags = self.worker_host.additional_tags
+
         if override_ami_id:
             self._ami_id = override_ami_id
+
+    @property
+    def agent_state(self) -> WorkerAgentState:
+        """Get the current state of the worker agent."""
+        return self._agent_state
+
+    @property
+    def instance_id(self) -> Optional[str]:
+        """Get the instance ID from the worker host."""
+        return self.worker_host.instance_id
+
+    @abc.abstractmethod
+    def _required_host_os(self) -> str:
+        """Return the required host operating system (e.g., 'windows', 'posix')."""
+        pass
 
     @abc.abstractmethod
     def ami_ssm_param_name(self) -> str:
@@ -172,8 +227,86 @@ class EC2InstanceWorker(DeadlineWorker):
         raise NotImplementedError("'ssm_document_name' was not implemented.")
 
     @abc.abstractmethod
-    def _setup_worker_agent(self) -> None:  # pragma: no cover
-        raise NotImplementedError("'_setup_worker_agent' was not implemented.")
+    def _install_agent(self, s3_files: list[tuple[str, str]] | None = None) -> None:
+        """Install worker agent software (OS-specific)."""
+        pass
+
+    @abc.abstractmethod
+    def _configure_agent(self) -> None:
+        """Configure worker agent (OS-specific)."""
+        pass
+
+    @abc.abstractmethod
+    def _start_agent_service(self) -> None:
+        """Start the worker agent service (OS-specific)."""
+        pass
+
+    @abc.abstractmethod
+    def _stop_agent_service(self) -> None:
+        """Stop the worker agent service (OS-specific)."""
+        pass
+
+    @abc.abstractmethod
+    def _cleanup_agent_state(self) -> None:
+        """Clean up worker agent state files (OS-specific)."""
+        pass
+
+    def _stage_s3_bucket(self) -> list[tuple[str, str]] | None:
+        """Stages file_mappings to an S3 bucket and returns the mapping of S3 URI to dest path"""
+        if not self.configuration.file_mappings:
+            LOG.info("No file mappings to stage to S3")
+            return None
+
+        s3_to_src_mapping: dict[str, str] = {}
+        s3_to_dst_mapping: dict[str, str] = {}
+        for src_glob, dst in self.configuration.file_mappings:
+            for src_file in glob.glob(src_glob):
+                s3_key = f"worker/{os.path.basename(src_file)}"
+                assert s3_key not in s3_to_src_mapping, (
+                    "Duplicate S3 keys generated for file mappings. All source files must have unique "
+                    + f"filenames. Mapping: {self.configuration.file_mappings}"
+                )
+                s3_to_src_mapping[s3_key] = src_file
+                s3_to_dst_mapping[f"s3://{self.bootstrap_bucket_name}/{s3_key}"] = dst
+
+        for key, local_path in s3_to_src_mapping.items():
+            LOG.info(f"Uploading file {local_path} to s3://{self.bootstrap_bucket_name}/{key}")
+            try:
+                # self.s3_client.upload_file(local_path, self.bootstrap_bucket_name, key)
+                with open(local_path, mode="rb") as f:
+                    self.s3_client.put_object(
+                        Bucket=self.bootstrap_bucket_name,
+                        Key=key,
+                        Body=f,
+                    )
+            except botocore.exceptions.ClientError as e:
+                LOG.exception(
+                    f"Failed to upload file {local_path} to s3://{self.bootstrap_bucket_name}/{key}: {e}"
+                )
+                raise
+
+        return list(s3_to_dst_mapping.items())
+
+    def _delete_worker(self) -> None:
+        """Delete the worker from Deadline Cloud service."""
+        if not self.worker_id:
+            LOG.info("No worker_id available, skipping worker deletion")
+            return
+
+        if not self.configuration.fleet.autoscaling:
+            try:
+                self.wait_until_stopped()
+            except TimeoutError:
+                LOG.warning(
+                    f"{self.worker_id} did not transition to a STOPPED status, forcibly stopping..."
+                )
+                self.set_stopped_status()
+
+            try:
+                self.delete()
+            except botocore.exceptions.ClientError as error:
+                LOG.exception(f"Failed to delete worker: {error}")
+                raise
 
     @abc.abstractmethod
     def configure_worker_command(
@@ -193,53 +326,75 @@ class EC2InstanceWorker(DeadlineWorker):
     def get_worker_id(self) -> str:
         raise NotImplementedError("'get_worker_id' was not implemented.")
 
-    @abc.abstractmethod
-    def userdata(self, s3_files) -> str:
-        raise NotImplementedError("'userdata' was not implemented.")
-
-    @abc.abstractmethod
-    def userdata_success_script(self) -> str:
-        raise NotImplementedError(f"'{self.userdata_success_script.__name__}' was not implemented")
-
-    @abc.abstractmethod
-    def ebs_devices(self) -> dict[str, int] | None:
-        """DeviceName -> VolumeSize (in GiBs) mapping"""
-        raise NotImplementedError("'ebs_devices' was not implemented.")
-
     def start(self) -> None:
+        """
+        Install, configure, and start the worker agent (assumes host is already running).
+
+        This method performs the complete worker agent startup:
+        1. Validate the worker host is running
+        2. Claim the worker host for this worker (prevents other workers from using it)
+        3. Stage files to S3 if needed
+        4. Install worker agent software on the host
+        5. Configure the worker agent with the provided configuration (farm, fleet, region, etc.)
+        6. Start the worker agent service
+        7. Retrieve and store the worker ID
+
+        Raises:
+            RuntimeError: If the worker host is not running
+            RuntimeError: If this worker already has an agent running
+            RuntimeError: If another worker already has an agent on this host
+        """
+        if not self.worker_host.is_running():
+            raise RuntimeError(
+                "Cannot start worker agent: worker host is not running. "
+                "Call worker_host.start() first."
+            )
+
+        if self._agent_state == WorkerAgentState.RUNNING:
+            raise RuntimeError(
+                "Cannot start worker agent: this worker already has an agent running. "
+                "Call stop() first to remove the existing agent."
+            )
+
+        # Claim the host for this worker (raises if another worker is using it)
+        self.worker_host._claim_for_worker(id(self))
+
+        # Stage files to S3 for worker agent configuration
         s3_files = self._stage_s3_bucket()
-        self._launch_instance(s3_files=s3_files)
 
-        success, status_message = self._wait_until_userdata_finishes()
-        assert success, f"Userdata failed:\n{status_message}"
-
-        self._setup_worker_agent()
+        # Install, configure, and start the worker agent
+        self._install_agent(s3_files)
+        self._configure_agent()
+        self._start_agent_service()
+        self.worker_id = self.get_worker_id()
+        self._agent_state = WorkerAgentState.RUNNING
 
     def stop(self) -> None:
-        LOG.info(f"Terminating EC2 instance {self.instance_id}")
-        self.ec2_client.terminate_instances(InstanceIds=[self.instance_id])
+        """
+        Stop the worker agent and remove all agent resources (leaves host running).
 
-        self.instance_id = None
+        This method performs complete worker agent teardown:
+        1. Stop the worker agent service
+        2. Remove worker agent state files (worker.json, configuration files, etc.)
+        3. Delete the worker from Deadline Cloud service
+        4. Clear the worker ID
+        5. Release the worker host so other workers can use it
 
-        # Only attempt worker-related cleanup if worker_id exists
-        if not self.worker_id:
-            LOG.info("No worker_id available, skipping worker cleanup")
+        After this method completes, the host is ready for a new worker agent configuration.
+        """
+        if self._agent_state == WorkerAgentState.NOT_STARTED:
+            # Nothing to clean up
             return
 
-        if not self.configuration.fleet.autoscaling:
-            try:
-                self.wait_until_stopped()
-            except TimeoutError:
-                LOG.warning(
-                    f"{self.worker_id} did not transition to a STOPPED status, forcibly stopping..."
-                )
-                self.set_stopped_status()
+        if self.worker_id:
+            self._stop_agent_service()
+            self._cleanup_agent_state()
+            self._delete_worker()
+            self.worker_id = None
 
-            try:
-                self.delete()
-            except botocore.exceptions.ClientError as error:
-                LOG.exception(f"Failed to delete worker: {error}")
-                raise
+        # Release the host so other workers can use it
+        self.worker_host._release_from_worker(id(self))
+        self._agent_state = WorkerAgentState.NOT_STARTED
 
     def delete(self):
         try:
@@ -336,294 +491,9 @@ class EC2InstanceWorker(DeadlineWorker):
 
         return WorkerLog(worker_id=self.worker_id, logs=log_events)  # type: ignore[arg-type]
 
-    @retry_with_predicate(
-        max_attempts=3, predicate=lambda e: isinstance(e, botocore.exceptions.WaiterError)
-    )
-    @retry_with_predicate(max_attempts=60, delay=10, backoff=1, predicate=is_instance_not_ready)
-    def send_command(
-        self, command: str, ssm_waiter_config: dict[str, int] = DEFAULT_WAITER_CONFIG
-    ) -> CommandResult:
-        """Send a command via SSM to a shell on a launched EC2 instance. Once the command has fully
-        finished the result of the invocation is returned.
-        """
-        ssm_waiter = self.ssm_client.get_waiter("command_executed")
-
-        # To successfully send an SSM Command to an instance the instance must:
-        #  1) Be in RUNNING state;
-        #  2) Have the AWS Systems Manager (SSM) Agent running; and
-        #  3) Have had enough time for the SSM Agent to connect to System's Manager
-        #
-        # If we send an SSM command then we will get an InvalidInstanceId error
-        # if the instance isn't in that state.
-
-        LOG.info(f"Sending SSM command to instance {self.instance_id}")
-        try:
-            send_command_response = self.ssm_client.send_command(
-                InstanceIds=[self.instance_id],
-                DocumentName=self.ssm_document_name(),
-                Parameters={"commands": [command]},
-            )
-        except botocore.exceptions.ClientError as error:
-            if error.response["Error"]["Code"] == "InvalidInstanceId":
-                LOG.warning(
-                    f"Instance {self.instance_id} is not ready for SSM command (received InvalidInstanceId error)."
-                )
-            raise
-
-        command_id = send_command_response["Command"]["CommandId"]
-
-        LOG.info(f"Waiting for SSM command {command_id} to reach a terminal state")
-        try:
-            ssm_waiter.wait(
-                InstanceId=self.instance_id,
-                CommandId=command_id,
-                WaiterConfig=ssm_waiter_config,
-            )
-        except botocore.exceptions.WaiterError as e:  # pragma: no cover
-            LOG.warning(f"WaiterError caught for command {command_id}:")
-            LOG.warning(f"\tError reason: {e!s}")
-            LOG.warning(f"\tWaiter last response: {e.last_response!s}")
-
-            if isinstance(e, botocore.exceptions.WaiterError) and (
-                "Undeliverable" in str(e) or "Undeliverable" in str(e.last_response)
-            ):
-                # if it wasn't delivered, retry. Otherwise let's check the command result.
-                LOG.warning(
-                    f"Unable to deliver command {command_id} to instance {self.instance_id} (received UndeliverableError)."
-                )
-                raise e
-
-        ssm_command_result = self.ssm_client.get_command_invocation(
-            InstanceId=self.instance_id,
-            CommandId=command_id,
-        )
-        result = CommandResult(
-            exit_code=ssm_command_result["ResponseCode"],
-            stdout=ssm_command_result["StandardOutputContent"],
-            stderr=ssm_command_result["StandardErrorContent"],
-        )
-        if result.exit_code == -1:  # pragma: no cover
-            # Response code of -1 in a terminal state means the command was not received by the node
-            LOG.error(f"Failed to send SSM command {command_id} to {self.instance_id}: {result}")
-
-        LOG.info(f"SSM command {command_id} completed with exit code: {result.exit_code}")
-        return result
-
-    def _stage_s3_bucket(self) -> list[tuple[str, str]] | None:
-        """Stages file_mappings to an S3 bucket and returns the mapping of S3 URI to dest path"""
-        if not self.configuration.file_mappings:
-            LOG.info("No file mappings to stage to S3")
-            return None
-
-        s3_to_src_mapping: dict[str, str] = {}
-        s3_to_dst_mapping: dict[str, str] = {}
-        for src_glob, dst in self.configuration.file_mappings:
-            for src_file in glob.glob(src_glob):
-                s3_key = f"worker/{os.path.basename(src_file)}"
-                assert s3_key not in s3_to_src_mapping, (
-                    "Duplicate S3 keys generated for file mappings. All source files must have unique "
-                    + f"filenames. Mapping: {self.configuration.file_mappings}"
-                )
-                s3_to_src_mapping[s3_key] = src_file
-                s3_to_dst_mapping[f"s3://{self.bootstrap_bucket_name}/{s3_key}"] = dst
-
-        for key, local_path in s3_to_src_mapping.items():
-            LOG.info(f"Uploading file {local_path} to s3://{self.bootstrap_bucket_name}/{key}")
-            try:
-                # self.s3_client.upload_file(local_path, self.bootstrap_bucket_name, key)
-                with open(local_path, mode="rb") as f:
-                    self.s3_client.put_object(
-                        Bucket=self.bootstrap_bucket_name,
-                        Key=key,
-                        Body=f,
-                    )
-            except botocore.exceptions.ClientError as e:
-                LOG.exception(
-                    f"Failed to upload file {local_path} to s3://{self.bootstrap_bucket_name}/{key}: {e}"
-                )
-                raise
-
-        return list(s3_to_dst_mapping.items())
-
-    def _launch_instance(self, *, s3_files: list[tuple[str, str]] | None = None) -> None:
-        assert (
-            not self.instance_id
-        ), "Attempted to launch EC2 instance when one was already launched"
-        try:
-            LOG.info("Launching EC2 instance")
-            LOG.info(
-                json.dumps(
-                    {
-                        "AMI_ID": self.ami_id,
-                        "Instance Profile": self.instance_profile_name,
-                        "User Data": self.userdata(s3_files),
-                    },
-                    indent=4,
-                    sort_keys=True,
-                )
-            )
-
-            tags = [
-                {
-                    "Key": "InstanceIdentification",
-                    "Value": "DeadlineScaffoldingWorker",
-                }
-            ]
-
-            for tag in self.additional_tags:
-                tags.append({"Key": tag.key, "Value": tag.value})
-
-            run_instance_request = {
-                "MinCount": 1,
-                "MaxCount": 1,
-                "ImageId": self.ami_id,
-                "InstanceType": self.instance_type,
-                "IamInstanceProfile": {"Name": self.instance_profile_name},
-                "SubnetId": self.subnet_id,
-                "SecurityGroupIds": [self.security_group_id],
-                "MetadataOptions": {"HttpTokens": "required", "HttpEndpoint": "enabled"},
-                "TagSpecifications": [
-                    {
-                        "ResourceType": "instance",
-                        "Tags": tags,
-                    }
-                ],
-                "InstanceInitiatedShutdownBehavior": self.instance_shutdown_behavior,
-                "UserData": self.userdata(s3_files),
-            }
-
-            devices = self.ebs_devices() or {}
-            device_mappings = [
-                {"DeviceName": name, "Ebs": {"VolumeSize": size}} for name, size in devices.items()
-            ]
-            if device_mappings:
-                run_instance_request["BlockDeviceMappings"] = device_mappings
-
-            run_instance_response = self.ec2_client.run_instances(**run_instance_request)
-
-            self.instance_id = run_instance_response["Instances"][0]["InstanceId"]
-            LOG.info(f"Launched EC2 instance {self.instance_id}")
-
-            LOG.info(f"Waiting for EC2 instance {self.instance_id} status to be OK")
-            instance_running_waiter = self.ec2_client.get_waiter("instance_status_ok")
-            instance_running_waiter.wait(
-                InstanceIds=[self.instance_id],
-                WaiterConfig={"Delay": 15, "MaxAttempts": 75},
-            )
-            LOG.info(f"EC2 instance {self.instance_id} status is OK")
-        except botocore.exceptions.WaiterError as e:
-            diagnostics = self._collect_instance_diagnostics()
-            raise InstanceStartupError(
-                message=f"Failed to wait for instance status: {e}", diagnostics=diagnostics
-            ) from e
-        except Exception as e:
-            LOG.error(f"Unexpected error during instance launch: {e}")
-            raise
-
-    def _collect_instance_diagnostics(self) -> str:
-        """Collect diagnostic information about the instance"""
-        if not self.instance_id:
-            return "No instance_id available for diagnostics"
-
-        diagnostic_info = []
-        diagnostic_info.append(f"Collecting diagnostics for instance {self.instance_id}")
-
-        # Get instance details
-        try:
-            instance_response = self.ec2_client.describe_instances(InstanceIds=[self.instance_id])
-            instance = instance_response["Reservations"][0]["Instances"][0]
-
-            # Log instance details
-            diagnostic_info.append(f"Instance state: {instance['State']['Name']}")
-            diagnostic_info.append(f"Instance type: {instance['InstanceType']}")
-            diagnostic_info.append(f"Launch time: {instance['LaunchTime']}")
-            diagnostic_info.append(
-                f"Availability zone: {instance['Placement']['AvailabilityZone']}"
-            )
-        except Exception as e:
-            diagnostic_info.append(f"Failed to get instance details: {e}")
-
-        # Get instance status
-        try:
-            status_response = self.ec2_client.describe_instance_status(
-                InstanceIds=[self.instance_id], IncludeAllInstances=True
-            )
-            if status_response["InstanceStatuses"]:
-                status = status_response["InstanceStatuses"][0]
-                diagnostic_info.append(
-                    f"System status: {status.get('SystemStatus', {}).get('Status', 'unknown')}"
-                )
-                diagnostic_info.append(
-                    f"Instance status: {status.get('InstanceStatus', {}).get('Status', 'unknown')}"
-                )
-
-                # Log status check details if available
-                if "SystemStatus" in status and "Details" in status["SystemStatus"]:
-                    for detail in status["SystemStatus"]["Details"]:
-                        diagnostic_info.append(
-                            f"System check {detail.get('Name')}: {detail.get('Status')}"
-                        )
-
-                if "InstanceStatus" in status and "Details" in status["InstanceStatus"]:
-                    for detail in status["InstanceStatus"]["Details"]:
-                        diagnostic_info.append(
-                            f"Instance check {detail.get('Name')}: {detail.get('Status')}"
-                        )
-        except Exception as e:
-            diagnostic_info.append(f"Failed to get instance status: {e}")
-        return "\n".join(diagnostic_info)
-
-    @property
-    def ami_id(self) -> str:
-        if not hasattr(self, "_ami_id"):
-            response = call_api(
-                description=f"Getting latest {type(self)} AMI ID from SSM parameter {self.ami_ssm_param_name()}",
-                fn=lambda: self.ssm_client.get_parameters(Names=[self.ami_ssm_param_name()]),
-            )
-
-            parameters = response.get("Parameters", [])
-            assert (
-                len(parameters) == 1
-            ), f"Received incorrect number of SSM parameters. Expected 1, got response: {response}"
-            self._ami_id = parameters[0]["Value"]
-            LOG.info(f"Using latest {type(self)} AMI {self._ami_id}")
-
-        return self._ami_id
-
-    def _wait_until_userdata_finishes(self) -> tuple[bool, str]:
-        result: CommandResult | None = None
-        success: bool = False
-        LOG.info("Waiting for userdata to finish")
-
-        def get_userdata_result() -> bool:
-            nonlocal result
-            nonlocal success
-            result = self.send_command(self.userdata_success_script())
-
-            if self.USERDATA_SUCCESS_STRING in str(result):
-                success = True
-                return True
-
-            if self.USERDATA_FAILURE_STRING in str(result):
-                success = False
-                return True
-
-            return False
-
-        # Raises TimeoutError if the userdata status cannot be fetched in
-        # the given timeframe.
-        wait_for(
-            description="getting the result of userdata",
-            predicate=get_userdata_result,
-            interval_s=5,
-            max_retries=60,
-        )
-
-        LOG.info(
-            "Userdata finished %s.",
-            "successfully" if success else "unsuccessfully",
-        )
-        return success, str(result)
+    def send_command(self, command: str) -> CommandResult:
+        """Delegate to worker host."""
+        return self.worker_host.send_command(command)
 
 
 @dataclass
@@ -641,6 +511,10 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
     SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME: ClassVar[str] = f"{SIGNAL_USER_DATA_DIR}\\success"
     SIGNAL_USER_DATA_FAILED_FILE_NAME: ClassVar[str] = f"{SIGNAL_USER_DATA_DIR}\\failed"
 
+    def _required_host_os(self) -> str:
+        """Windows workers require Windows hosts."""
+        return "windows"
+
     def ebs_devices(self) -> dict[str, int] | None:
         """DeviceName -> VolumeSize (in GiBs) mapping"""
         # defaults to 60GB to match SMF, aws gives 30GB by default
@@ -648,6 +522,56 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
 
     def ssm_document_name(self) -> str:
         return "AWS-RunPowerShellScript"
+
+    def send_command(
+        self, command: str, ssm_waiter_config: dict[str, int] = DEFAULT_WAITER_CONFIG
+    ) -> CommandResult:
+        """Delegate to worker host with Windows-specific command handling."""
+        return self.worker_host.send_command(command, ssm_waiter_config)
+
+    def _install_agent(self, s3_files: list[tuple[str, str]] | None = None) -> None:
+        """Install worker agent software on Windows."""
+        # Installation is handled in _configure_agent for Windows
+        pass
+
+    def _configure_agent(self) -> None:
+        """Configure worker agent on Windows."""
+        assert self.instance_id
+        LOG.info(f"Sending SSM command to configure Worker agent on instance {self.instance_id}")
+
+        cmd_result = self.send_command(
+            f"{self.configure_worker_command(config=self.configuration)}",
+            {"Delay": 5, "MaxAttempts": 48},
+        )
+        assert cmd_result.exit_code == 0, f"Failed to configure Worker agent: {cmd_result}"
+        LOG.info("Successfully configured Worker agent")
+
+    def _start_agent_service(self) -> None:
+        """Start the worker agent service."""
+        if self.configuration.start_service:
+            LOG.info(
+                f"Sending SSM command to start Windows Worker agent on instance {self.instance_id}"
+            )
+            self.start_worker_service()
+            LOG.info("Successfully started Worker agent")
+
+    def _stop_agent_service(self) -> None:
+        """Stop the worker agent service."""
+        self.stop_worker_service()
+
+    def _cleanup_agent_state(self) -> None:
+        """Clean up worker agent state files on Windows."""
+        # Remove worker state files
+        cleanup_commands = [
+            'Remove-Item -Path "C:\\ProgramData\\Amazon\\Deadline\\Cache\\worker.json" -Force -ErrorAction SilentlyContinue',
+            'Remove-Item -Path "C:\\ProgramData\\Amazon\\Deadline\\Logs\\*" -Force -Recurse -ErrorAction SilentlyContinue',
+        ]
+
+        for cmd in cleanup_commands:
+            try:
+                self.send_command(cmd)
+            except Exception as e:
+                LOG.warning(f"Failed to clean up agent state: {e}")
 
     def _setup_worker_agent(self) -> None:
         assert self.instance_id
@@ -923,6 +847,10 @@ class PosixInstanceWorkerBase(EC2InstanceWorker):
     SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME: ClassVar[str] = f"{SIGNAL_USER_DATA_SUCCESS_DIR}/success"
     SIGNAL_USER_DATA_FAILED_FILE_NAME: ClassVar[str] = f"{SIGNAL_USER_DATA_SUCCESS_DIR}/failed"
 
+    def _required_host_os(self) -> str:
+        """POSIX workers require POSIX hosts."""
+        return "posix"
+
     def ebs_devices(self) -> dict[str, int] | None:
         """DeviceName -> VolumeSize (in GiBs) mapping"""
         # defaults to 30GB to match SMF, aws gives 8GB by default
@@ -934,7 +862,52 @@ class PosixInstanceWorkerBase(EC2InstanceWorker):
     def send_command(
         self, command: str, ssm_waiter_config: dict[str, int] = DEFAULT_WAITER_CONFIG
     ) -> CommandResult:
-        return super().send_command("set -euxo pipefail; " + command, ssm_waiter_config)
+        """Delegate to worker host with POSIX-specific command prefix."""
+        return self.worker_host.send_command(command, ssm_waiter_config)
+
+    def _install_agent(self, s3_files: list[tuple[str, str]] | None = None) -> None:
+        """Install worker agent software on POSIX."""
+        # Installation is handled in _configure_agent for POSIX
+        pass
+
+    def _configure_agent(self) -> None:
+        """Configure worker agent on POSIX."""
+        assert self.instance_id
+        LOG.info(
+            f"Starting worker for farm: {self.configuration.farm_id} and fleet: {self.configuration.fleet.id}"
+        )
+        LOG.info(f"Sending SSM command to configure Worker agent on instance {self.instance_id}")
+
+        cmd_result = self.send_command(self.configure_worker_command(config=self.configuration))
+        assert cmd_result.exit_code == 0, f"Failed to configure Worker agent: {cmd_result}"
+        LOG.info("Successfully configured Worker agent")
+
+    def _start_agent_service(self) -> None:
+        """Start the worker agent service."""
+        if self.configuration.start_service:
+            LOG.info(
+                f"Sending SSM command to configure Worker agent on instance {self.instance_id}"
+            )
+            self.start_worker_service()
+            LOG.info("Successfully started worker agent")
+
+    def _stop_agent_service(self) -> None:
+        """Stop the worker agent service."""
+        self.stop_worker_service()
+
+    def _cleanup_agent_state(self) -> None:
+        """Clean up worker agent state files on POSIX."""
+        # Remove worker state files
+        cleanup_commands = [
+            "rm -f /var/lib/deadline/worker.json",
+            "rm -rf /var/log/amazon/deadline/*",
+        ]
+
+        for cmd in cleanup_commands:
+            try:
+                self.send_command(cmd)
+            except Exception as e:
+                LOG.warning(f"Failed to clean up agent state: {e}")
 
     def _setup_worker_agent(self) -> None:
         assert self.instance_id

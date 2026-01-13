@@ -972,3 +972,177 @@ class TestEC2WorkerHostPropertyTests:
         assert host.userdata(None) is not None
         # ebs_devices() can return None, so just verify it's callable
         host.ebs_devices()  # Should not raise an exception
+
+
+class TestEC2InstanceWorkerComposition:
+    """Test EC2InstanceWorker composition architecture."""
+
+    def test_property_19_composition_architecture(self):
+        """
+        **Feature: worker-host-decoupling, Property 19: Composition architecture**
+
+        For any EC2InstanceWorker, the worker should compose a WorkerHost instance and
+        delegate host operations to it while maintaining worker agent state independently.
+        The worker should validate OS compatibility during initialization.
+
+        **Validates: Requirements 4.5**
+        """
+        from deadline_test_fixtures.deadline.worker import (
+            WindowsInstanceWorkerBase,
+            PosixInstanceWorkerBase,
+            DeadlineWorkerConfiguration,
+        )
+        from deadline_test_fixtures.deadline.resources import Fleet
+
+        # Create mock concrete worker classes for testing
+        class MockWindowsWorker(WindowsInstanceWorkerBase):
+            def ami_ssm_param_name(self) -> str:
+                return "/test/windows/ami"
+
+            def ssm_document_name(self) -> str:
+                return "AWS-RunPowerShellScript"
+
+            def configure_worker_command(self, *, config) -> str:
+                return "mock windows command"
+
+            def userdata(self, s3_files) -> str:
+                return "<powershell>mock userdata</powershell>"
+
+            def userdata_success_script(self) -> str:
+                return "mock success script"
+
+            def ebs_devices(self) -> dict[str, int] | None:
+                return {"/dev/sda1": 60}
+
+        class MockPosixWorker(PosixInstanceWorkerBase):
+            def ami_ssm_param_name(self) -> str:
+                return "/test/posix/ami"
+
+            def ssm_document_name(self) -> str:
+                return "AWS-RunShellScript"
+
+            def configure_worker_command(self, *, config) -> str:
+                return "mock posix command"
+
+            def userdata(self, s3_files) -> str:
+                return "#!/bin/bash\nmock userdata"
+
+            def userdata_success_script(self) -> str:
+                return "mock success script"
+
+            def ebs_devices(self) -> dict[str, int] | None:
+                return {"/dev/xvda": 30}
+
+        # Test both Windows and POSIX combinations
+        test_cases = [
+            (MockWindowsWorker, WindowsEC2WorkerHost, "windows"),
+            (MockPosixWorker, PosixEC2WorkerHost, "posix"),
+        ]
+
+        for worker_class, host_class, operating_system in test_cases:
+            # Create mock clients for the WorkerHost
+            mock_clients = {
+                "s3_client": Mock(),
+                "ec2_client": Mock(),
+                "ssm_client": Mock(),
+            }
+
+            # Mock SSM parameter response for AMI ID
+            mock_clients["ssm_client"].get_parameters.return_value = {
+                "Parameters": [{"Value": f"ami-{operating_system}123"}]
+            }
+
+            # Create the WorkerHost
+            worker_host = host_class(
+                subnet_id="subnet-12345",
+                security_group_id="sg-12345",
+                instance_profile_name="test-profile",
+                bootstrap_bucket_name="test-bucket",
+                instance_type="t3.micro",
+                instance_shutdown_behavior="terminate",
+                **mock_clients,
+            )
+
+            # Create a mock configuration
+            mock_fleet = Mock(spec=Fleet)
+            mock_fleet.id = "fleet-12345"
+            mock_fleet.autoscaling = False
+
+            configuration = Mock(spec=DeadlineWorkerConfiguration)
+            configuration.farm_id = "farm-12345"
+            configuration.fleet = mock_fleet
+            configuration.region = "us-west-2"
+
+            # Create a mock deadline client
+            mock_deadline_client = Mock()
+
+            # Test 1: Valid OS combination should succeed
+            worker = worker_class(
+                configuration=configuration,
+                worker_host=worker_host,
+                deadline_client=mock_deadline_client,
+            )
+
+            # Verify composition is working
+            assert worker.worker_host is worker_host
+            assert worker.configuration is configuration
+            assert worker.deadline_client is mock_deadline_client
+
+            # Verify agent state tracking
+            assert hasattr(worker, "_agent_state")
+            assert worker.agent_state == WorkerAgentState.NOT_STARTED
+
+            # Verify OS validation worked
+            assert worker._required_host_os() == operating_system
+            assert worker.worker_host._operating_system() == operating_system
+
+            # Verify legacy field delegation
+            assert worker.subnet_id == worker_host.subnet_id
+            assert worker.security_group_id == worker_host.security_group_id
+            assert worker.instance_profile_name == worker_host.instance_profile_name
+            assert worker.bootstrap_bucket_name == worker_host.bootstrap_bucket_name
+            assert worker.s3_client is worker_host.s3_client
+            assert worker.ec2_client is worker_host.ec2_client
+            assert worker.ssm_client is worker_host.ssm_client
+
+            # Test 2: Invalid OS combination should raise ValueError
+            # Create a host with the opposite OS
+            opposite_os = "posix" if operating_system == "windows" else "windows"
+            opposite_host_class = (
+                PosixEC2WorkerHost if operating_system == "windows" else WindowsEC2WorkerHost
+            )
+
+            # Mock SSM parameter response for opposite OS
+            mock_clients["ssm_client"].get_parameters.return_value = {
+                "Parameters": [{"Value": f"ami-{opposite_os}123"}]
+            }
+
+            opposite_host = opposite_host_class(
+                subnet_id="subnet-12345",
+                security_group_id="sg-12345",
+                instance_profile_name="test-profile",
+                bootstrap_bucket_name="test-bucket",
+                instance_type="t3.micro",
+                instance_shutdown_behavior="terminate",
+                **mock_clients,
+            )
+
+            # This should raise ValueError due to OS mismatch
+            with pytest.raises(ValueError) as exc_info:
+                worker_class(
+                    configuration=configuration,
+                    worker_host=opposite_host,
+                    deadline_client=mock_deadline_client,
+                )
+
+            error_message = str(exc_info.value)
+            assert (
+                f"Worker requires {operating_system} host but got {opposite_os} host"
+                in error_message
+            )
+            assert "Ensure you use the correct WorkerHost type" in error_message
+
+            # Test 3: Verify abstract method implementation
+            assert hasattr(worker, "_required_host_os")
+            assert callable(worker._required_host_os)
+            assert worker._required_host_os() == operating_system

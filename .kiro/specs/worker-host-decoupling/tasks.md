@@ -54,7 +54,7 @@
 
 ## Phase 2: Refactor EC2InstanceWorker Classes
 
-- [ ] 4. Add WorkerHost composition to EC2InstanceWorker and property test
+- [x] 4. Add WorkerHost composition to EC2InstanceWorker and property test
   - Add `worker_host: EC2WorkerHost` field to `EC2InstanceWorker`
   - Add `WorkerAgentState` tracking to `EC2InstanceWorker`
   - Implement OS validation in `__post_init__()` method
@@ -64,7 +64,7 @@
   - _Requirements: 4.2, 4.5_
   - _Validates: Requirements 4.5_
 
-- [ ] 5. Refactor EC2InstanceWorker lifecycle methods, add property tests, and update existing tests
+- [x] 5. Refactor EC2InstanceWorker lifecycle methods, add property tests, and update existing tests
   - Refactor `start()` method to only handle worker agent lifecycle
   - Refactor `stop()` method to only handle worker agent cleanup
   - Add host ownership claiming/releasing logic

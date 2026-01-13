@@ -33,6 +33,11 @@ from .deadline.worker import (
     WindowsInstanceBuildWorker,
     EC2InstanceWorker,
 )
+from .deadline.worker_host import (
+    PosixEC2WorkerHost,
+    WindowsEC2WorkerHost,
+    EC2WorkerHost,
+)
 from .models import (
     CodeArtifactRepositoryInfo,
     JobAttachmentSettings,
@@ -596,19 +601,41 @@ def worker(
         ssm_client = boto3.client("ssm")
         deadline_client = boto3.client("deadline")
 
+        # Create the appropriate WorkerHost based on the worker type
+        worker_host: EC2WorkerHost
+        if ec2_worker_type == PosixInstanceBuildWorker:
+            worker_host = PosixEC2WorkerHost(
+                subnet_id=subnet_id,
+                security_group_id=security_group_id,
+                instance_profile_name=bootstrap_resources.worker_instance_profile_name,
+                bootstrap_bucket_name=bootstrap_resources.bootstrap_bucket_name,
+                s3_client=s3_client,
+                ec2_client=ec2_client,
+                ssm_client=ssm_client,
+                instance_type=instance_type,
+                instance_shutdown_behavior=instance_shutdown_behavior,
+                override_ami_id=ami_id,
+            )
+        elif ec2_worker_type == WindowsInstanceBuildWorker:
+            worker_host = WindowsEC2WorkerHost(
+                subnet_id=subnet_id,
+                security_group_id=security_group_id,
+                instance_profile_name=bootstrap_resources.worker_instance_profile_name,
+                bootstrap_bucket_name=bootstrap_resources.bootstrap_bucket_name,
+                s3_client=s3_client,
+                ec2_client=ec2_client,
+                ssm_client=ssm_client,
+                instance_type=instance_type,
+                instance_shutdown_behavior=instance_shutdown_behavior,
+                override_ami_id=ami_id,
+            )
+        else:
+            raise ValueError(f"Unsupported worker type: {ec2_worker_type}")
+
         worker = ec2_worker_type(
-            ec2_client=ec2_client,
-            s3_client=s3_client,
-            deadline_client=deadline_client,
-            bootstrap_bucket_name=bootstrap_resources.bootstrap_bucket_name,
-            ssm_client=ssm_client,
-            override_ami_id=ami_id,
-            subnet_id=subnet_id,
-            security_group_id=security_group_id,
-            instance_profile_name=bootstrap_resources.worker_instance_profile_name,
             configuration=worker_config,
-            instance_type=instance_type,
-            instance_shutdown_behavior=instance_shutdown_behavior,
+            worker_host=worker_host,
+            deadline_client=deadline_client,
         )
 
     def stop_worker():
