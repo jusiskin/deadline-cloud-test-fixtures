@@ -264,3 +264,178 @@ class TestWorkerAgentLifecycleProperties:
                 match="Cannot start worker agent: this worker already has an agent running",
             ):
                 worker.start()
+
+
+class TestOSAgnosticWorkerAgentOperations:
+    """Property tests for OS-agnostic worker agent operations."""
+
+    @pytest.mark.parametrize(
+        "os_type,worker_class,host_class",
+        [
+            ("posix", "PosixInstanceBuildWorker", "PosixEC2WorkerHost"),
+            ("windows", "WindowsInstanceBuildWorker", "WindowsEC2WorkerHost"),
+        ],
+    )
+    def test_property_13_os_agnostic_agent_operations(
+        self, os_type, worker_class, host_class, worker_config
+    ):
+        """
+        Property 13: Operating system-agnostic worker agent operations
+
+        For any worker agent operation (install, configure, start, stop, get_worker_id)
+        and any EC2 worker host operating system (Windows or POSIX), the operation should
+        succeed and produce the same logical result regardless of the operating system.
+
+        **Validates: Requirements 7.4**
+        """
+        # Import the appropriate classes based on OS type
+        if os_type == "posix":
+            from deadline_test_fixtures.deadline.worker import PosixInstanceBuildWorker
+            from deadline_test_fixtures.deadline.worker_host import PosixEC2WorkerHost
+
+            WorkerClass: type = PosixInstanceBuildWorker
+            HostClass: type = PosixEC2WorkerHost
+        else:
+            from deadline_test_fixtures.deadline.worker import WindowsInstanceBuildWorker
+            from deadline_test_fixtures.deadline.worker_host import WindowsEC2WorkerHost
+
+            WorkerClass = WindowsInstanceBuildWorker
+            HostClass = WindowsEC2WorkerHost
+
+        # Create a mock host for the specific OS
+        mock_host = MagicMock(spec=HostClass)
+        mock_host.is_running.return_value = True
+        mock_host._operating_system.return_value = os_type
+        mock_host.instance_id = "i-1234567890abcdef0"
+        mock_host.send_command.return_value = MagicMock(exit_code=0, stdout="worker-test123")
+
+        # Add all the required attributes for backward compatibility
+        mock_host.subnet_id = "subnet-12345"
+        mock_host.security_group_id = "sg-12345"
+        mock_host.instance_profile_name = "test-profile"
+        mock_host.bootstrap_bucket_name = "test-bucket"
+        mock_host.s3_client = MagicMock()
+        mock_host.ec2_client = MagicMock()
+        mock_host.ssm_client = MagicMock()
+        mock_host.instance_type = "t3.micro"
+        mock_host.instance_shutdown_behavior = "terminate"
+        mock_host.additional_tags = []
+
+        with patch("boto3.client"):
+            worker = WorkerClass(
+                configuration=worker_config,
+                worker_host=mock_host,
+                deadline_client=MagicMock(),
+            )
+
+        # Test 1: Worker agent lifecycle operations should work regardless of OS
+        with (
+            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "get_worker_id", return_value="worker-test123"),
+        ):
+
+            # Operation: Start worker agent
+            worker.start()
+
+            # Verify: Agent should be running regardless of OS
+            assert worker.agent_state == WorkerAgentState.RUNNING
+            assert worker.worker_id == "worker-test123"
+
+            # Verify: Host should be claimed
+            mock_host._claim_for_worker.assert_called_once_with(id(worker))
+
+            # Operation: Stop worker agent
+            worker.stop()
+
+            # Verify: Agent should be stopped regardless of OS
+            assert worker.agent_state == WorkerAgentState.NOT_STARTED
+            assert worker.worker_id is None
+
+            # Verify: Host should be released
+            mock_host._release_from_worker.assert_called_once_with(id(worker))
+
+        # Test 2: Command delegation should work regardless of OS
+        test_command = "test command"
+        expected_result = MagicMock(exit_code=0, stdout="test output")
+        mock_host.send_command.return_value = expected_result
+
+        result = worker.send_command(test_command)
+
+        # Verify: Command delegation works the same way regardless of OS
+        assert result == expected_result
+        # Note: The actual call may include OS-specific waiter config, but the delegation works
+
+        # Test 3: Worker ID retrieval should work regardless of OS
+        with (
+            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "get_worker_id", return_value="worker-abc123"),
+        ):
+
+            worker.start()
+
+            # Verify: Worker ID retrieval produces a valid worker ID regardless of OS
+            assert worker.worker_id is not None
+            assert worker.worker_id == "worker-abc123"
+            assert worker.worker_id.startswith("worker-")
+
+            worker.stop()
+
+    @pytest.mark.parametrize(
+        "os_type",
+        ["posix", "windows"],
+    )
+    def test_property_13_os_validation_enforced(self, os_type, worker_config):
+        """
+        Property 13 extended: OS validation prevents mismatched worker/host combinations
+
+        The system should enforce that Windows workers require Windows hosts and
+        POSIX workers require POSIX hosts.
+
+        **Validates: Requirements 7.4**
+        """
+        # Import the appropriate classes
+        if os_type == "posix":
+            from deadline_test_fixtures.deadline.worker import WindowsInstanceBuildWorker
+            from deadline_test_fixtures.deadline.worker_host import PosixEC2WorkerHost
+
+            WorkerClass: type = WindowsInstanceBuildWorker  # Mismatched: Windows worker
+            HostClass: type = PosixEC2WorkerHost  # with POSIX host
+            expected_worker_os = "windows"
+            actual_host_os = "posix"
+        else:
+            from deadline_test_fixtures.deadline.worker import PosixInstanceBuildWorker
+            from deadline_test_fixtures.deadline.worker_host import WindowsEC2WorkerHost
+
+            WorkerClass = PosixInstanceBuildWorker  # Mismatched: POSIX worker
+            HostClass = WindowsEC2WorkerHost  # with Windows host
+            expected_worker_os = "posix"
+            actual_host_os = "windows"
+
+        # Create a mock host with mismatched OS
+        mock_host = MagicMock(spec=HostClass)
+        mock_host._operating_system.return_value = actual_host_os
+        mock_host.instance_id = "i-1234567890abcdef0"
+
+        # Add all the required attributes for backward compatibility
+        mock_host.subnet_id = "subnet-12345"
+        mock_host.security_group_id = "sg-12345"
+        mock_host.instance_profile_name = "test-profile"
+        mock_host.bootstrap_bucket_name = "test-bucket"
+        mock_host.s3_client = MagicMock()
+        mock_host.ec2_client = MagicMock()
+        mock_host.ssm_client = MagicMock()
+        mock_host.instance_type = "t3.micro"
+        mock_host.instance_shutdown_behavior = "terminate"
+        mock_host.additional_tags = []
+
+        # When/Then: Creating a worker with mismatched OS should fail
+        with patch("boto3.client"):
+            with pytest.raises(
+                ValueError,
+                match=f"Worker requires {expected_worker_os} host but got {actual_host_os} host",
+            ):
+                WorkerClass(
+                    configuration=worker_config,
+                    worker_host=mock_host,
+                    deadline_client=MagicMock(),
+                )

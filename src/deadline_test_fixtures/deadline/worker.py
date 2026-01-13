@@ -219,14 +219,6 @@ class EC2InstanceWorker(DeadlineWorker):
         pass
 
     @abc.abstractmethod
-    def ami_ssm_param_name(self) -> str:
-        raise NotImplementedError("'ami_ssm_param_name' was not implemented.")
-
-    @abc.abstractmethod
-    def ssm_document_name(self) -> str:
-        raise NotImplementedError("'ssm_document_name' was not implemented.")
-
-    @abc.abstractmethod
     def _install_agent(self, s3_files: list[tuple[str, str]] | None = None) -> None:
         """Install worker agent software (OS-specific)."""
         pass
@@ -498,30 +490,23 @@ class EC2InstanceWorker(DeadlineWorker):
 
 @dataclass
 class WindowsInstanceWorkerBase(EC2InstanceWorker):
-    """Base class from which Windows ec2 test instances are derived.
-
-    The methods in this base class are written with two cases of worker hosts in mind:
-    1. A host that is based on a stock Windows server AMI, with no Deadline-anything installed, that
-       must install the worker agent and the like during boot-up.
-    2. A host that already has the worker agent, job/agent users, and the like baked into
-       the host AMI in a location & manner that may differ from case (1).
     """
+    Base class for Windows EC2 workers.
 
-    SIGNAL_USER_DATA_DIR: ClassVar[str] = "C:\\signal_user_data_finished"
-    SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME: ClassVar[str] = f"{SIGNAL_USER_DATA_DIR}\\success"
-    SIGNAL_USER_DATA_FAILED_FILE_NAME: ClassVar[str] = f"{SIGNAL_USER_DATA_DIR}\\failed"
+    Args:
+        configuration: Worker agent configuration
+        worker_host: WindowsEC2WorkerHost to use (required)
+
+    Example:
+        >>> host = WindowsEC2WorkerHost(subnet_id="...", security_group_id="...", ...)
+        >>> host.start()
+        >>> worker = WindowsInstanceBuildWorker(configuration=config, worker_host=host)
+        >>> worker.start()
+    """
 
     def _required_host_os(self) -> str:
         """Windows workers require Windows hosts."""
         return "windows"
-
-    def ebs_devices(self) -> dict[str, int] | None:
-        """DeviceName -> VolumeSize (in GiBs) mapping"""
-        # defaults to 60GB to match SMF, aws gives 30GB by default
-        return {"/dev/sda1": 60}
-
-    def ssm_document_name(self) -> str:
-        return "AWS-RunPowerShellScript"
 
     def send_command(
         self, command: str, ssm_waiter_config: dict[str, int] = DEFAULT_WAITER_CONFIG
@@ -573,23 +558,61 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
             except Exception as e:
                 LOG.warning(f"Failed to clean up agent state: {e}")
 
-    def _setup_worker_agent(self) -> None:
-        assert self.instance_id
-        LOG.info(f"Sending SSM command to configure Worker agent on instance {self.instance_id}")
+    # Abstract methods that subclasses must implement
+    @abc.abstractmethod
+    def configure_worker_command(self, *, config: DeadlineWorkerConfiguration) -> str:
+        """Generate the command to configure the worker agent."""
+        pass
+
+    # Public methods for worker agent management
+    def start_worker_service(self) -> None:
+        """Start the worker agent Windows service."""
+        LOG.info("Sending command to start the Worker Agent service")
 
         cmd_result = self.send_command(
-            f"{self.configure_worker_command(config=self.configuration)}",
-            {"Delay": 5, "MaxAttempts": 48},
+            " ; ".join(
+                [
+                    'Start-Service -Name "DeadlineWorker"',
+                    "echo 'Running Get-Process to check if the agent is running'",
+                    'for($i=1; $i -le 30 -and "" -ne $err ; $i++){sleep $i; Get-Process pythonservice -ErrorVariable err}',
+                    "IF(Get-Process pythonservice){echo '+++SERVICE IS RUNNING+++'}ELSE{echo '+++SERVICE NOT RUNNING+++'; Get-Content -Encoding utf8 C:\\ProgramData\\Amazon\\Deadline\\Logs\\worker-agent-bootstrap.log,C:\\ProgramData\\Amazon\\Deadline\\Logs\\worker-agent.log; exit 1}",
+                ]
+            ),
         )
-        assert cmd_result.exit_code == 0, f"Failed to configure Worker agent: {cmd_result}"
-        LOG.info("Successfully configured Worker agent")
 
-        if self.configuration.start_service:
-            LOG.info(
-                f"Sending SSM command to start Windows Worker agent on instance {self.instance_id}"
-            )
-            self.start_worker_service()
-            LOG.info("Successfully started Worker agent")
+        assert cmd_result.exit_code == 0, f"Failed to start Worker Agent service: : {cmd_result}"
+
+        self.worker_id = self.get_worker_id()
+
+    def stop_worker_service(self) -> None:
+        """Stop the worker agent Windows service."""
+        LOG.info("Sending command to stop the Worker Agent service")
+        cmd_result = self.send_command('Stop-Service -Name "DeadlineWorker"')
+
+        assert cmd_result.exit_code == 0, f"Failed to stop Worker Agent service: : {cmd_result}"
+
+    def get_worker_id(self) -> str:
+        """Retrieve the worker ID from the worker agent."""
+        LOG.info(f"Sending SSM command to get the worker ID on instance {self.instance_id}")
+        cmd_result = self.send_command(
+            " ; ".join(
+                [
+                    'for($i=1; $i -le 20 -and "" -ne $err ; $i++){sleep $i; Get-Item C:\\ProgramData\\Amazon\\Deadline\\Cache\\worker.json -ErrorVariable err 1>$null}',
+                    "$worker=Get-Content -Raw C:\\ProgramData\\Amazon\\Deadline\\Cache\\worker.json | ConvertFrom-Json",
+                    "echo $worker.worker_id",
+                ]
+            ),
+            {"Delay": 5, "MaxAttempts": 36},
+        )
+        assert cmd_result.exit_code == 0, f"Failed to get Worker ID: {cmd_result}"
+
+        worker_id = cmd_result.stdout.rstrip("\n\r")
+        assert re.match(
+            r"^worker-[0-9a-f]{32}$", worker_id
+        ), f"Got nonvalid Worker ID from command stdout: {cmd_result}"
+
+        LOG.info(f"Obtained Worker ID: {worker_id}")
+        return worker_id
 
     def configure_worker_common(self, *, config: DeadlineWorkerConfiguration) -> str:
         """Get the command to configure the Worker. This must be run as Administrator.
@@ -638,52 +661,6 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
 
         return "; ".join(cmds)
 
-    def start_worker_service(self):
-        LOG.info("Sending command to start the Worker Agent service")
-
-        cmd_result = self.send_command(
-            " ; ".join(
-                [
-                    'Start-Service -Name "DeadlineWorker"',
-                    "echo 'Running Get-Process to check if the agent is running'",
-                    'for($i=1; $i -le 30 -and "" -ne $err ; $i++){sleep $i; Get-Process pythonservice -ErrorVariable err}',
-                    "IF(Get-Process pythonservice){echo '+++SERVICE IS RUNNING+++'}ELSE{echo '+++SERVICE NOT RUNNING+++'; Get-Content -Encoding utf8 C:\\ProgramData\\Amazon\\Deadline\\Logs\\worker-agent-bootstrap.log,C:\\ProgramData\\Amazon\\Deadline\\Logs\\worker-agent.log; exit 1}",
-                ]
-            ),
-        )
-
-        assert cmd_result.exit_code == 0, f"Failed to start Worker Agent service: : {cmd_result}"
-
-        self.worker_id = self.get_worker_id()
-
-    def stop_worker_service(self):
-        LOG.info("Sending command to stop the Worker Agent service")
-        cmd_result = self.send_command('Stop-Service -Name "DeadlineWorker"')
-
-        assert cmd_result.exit_code == 0, f"Failed to stop Worker Agent service: : {cmd_result}"
-
-    def get_worker_id(self) -> str:
-        LOG.info(f"Sending SSM command to get the worker ID on instance {self.instance_id}")
-        cmd_result = self.send_command(
-            " ; ".join(
-                [
-                    'for($i=1; $i -le 20 -and "" -ne $err ; $i++){sleep $i; Get-Item C:\\ProgramData\\Amazon\\Deadline\\Cache\\worker.json -ErrorVariable err 1>$null}',
-                    "$worker=Get-Content -Raw C:\\ProgramData\\Amazon\\Deadline\\Cache\\worker.json | ConvertFrom-Json",
-                    "echo $worker.worker_id",
-                ]
-            ),
-            {"Delay": 5, "MaxAttempts": 36},
-        )
-        assert cmd_result.exit_code == 0, f"Failed to get Worker ID: {cmd_result}"
-
-        worker_id = cmd_result.stdout.rstrip("\n\r")
-        assert re.match(
-            r"^worker-[0-9a-f]{32}$", worker_id
-        ), f"Got nonvalid Worker ID from command stdout: {cmd_result}"
-
-        LOG.info(f"Obtained Worker ID: {worker_id}")
-        return worker_id
-
     def get_windows_user_secret_cmd(self, secret_id: str) -> str:
         """
         Returns a PowerShell command string that will retrieve and use the secret on the worker instance itself.
@@ -709,8 +686,6 @@ class WindowsInstanceBuildWorker(WindowsInstanceWorkerBase):
     This class represents a Windows EC2 Worker Host.
     Any commands must be written in Powershell.
     """
-
-    WIN2022_AMI_NAME: ClassVar[str] = "Windows_Server-2022-English-Full-Base"
 
     def configure_worker_command(self, *, config: DeadlineWorkerConfiguration) -> str:
         """Get the command to configure the Worker. This must be run as Administrator."""
@@ -754,110 +729,26 @@ class WindowsInstanceBuildWorker(WindowsInstanceWorkerBase):
 
         return "; ".join(cmds)
 
-    def userdata_success_script(self) -> str:
-        return f"""
-$ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
-Set-PSDebug -Trace 1
-if (Test-Path "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME}") {{
-    echo "{self.USERDATA_SUCCESS_STRING}"
-    exit 0
-}}
-if (Test-Path "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}") {{
-    echo "{self.USERDATA_FAILURE_STRING}"
-    cat "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}"
-    exit 0
-}}
-"""
-
-    def userdata(self, s3_files) -> str:
-        copy_s3_command = ""
-        job_users_cmds = []
-
-        if s3_files:
-            copy_s3_command = " ; ".join([f"aws s3 cp {s3_uri} {dst}" for s3_uri, dst in s3_files])
-
-        if self.configuration.windows_job_users:
-            for job_user in self.configuration.windows_job_users:
-                job_users_cmds.append(
-                    f"New-LocalUser -Name {job_user} -Password $password -FullName {job_user} -Description {job_user}"
-                )
-                job_users_cmds.append(
-                    f"$Cred = New-Object System.Management.Automation.PSCredential {job_user}, $password"
-                )
-                job_users_cmds.append(
-                    'Start-Process cmd.exe -Credential $Cred -ArgumentList "/C" -LoadUserProfile -NoNewWindow'
-                )
-
-        configure_job_users = "\n".join(job_users_cmds)
-
-        userdata = f"""<powershell>
-$ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
-Set-PSDebug -Trace 1
-$successDir="{self.SIGNAL_USER_DATA_DIR}"
-mkdir $successDir -Force
-try {{
-    $ProgressPreference = 'SilentlyContinue'
-    Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" -OutFile "C:\\python-3.12.10-amd64.exe"
-    $installerHash=(Get-FileHash "C:\\python-3.12.10-amd64.exe" -Algorithm "MD5")
-    $expectedHash="5eddb0b6f12c852725de071ae681dde4"
-    if ($installerHash.Hash -ne $expectedHash) {{ throw "Could not verify Python installer." }}
-    Start-Process -FilePath "C:\\python-3.12.10-amd64.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 AppendPath=1" -Wait
-    Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -Outfile "C:\\AWSCLIV2.msi"
-    Start-Process msiexec.exe -ArgumentList "/i C:\\AWSCLIV2.msi /quiet" -Wait
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine")
-    $secret = aws secretsmanager get-secret-value --secret-id WindowsPasswordSecret --query SecretString --output text | ConvertFrom-Json
-    $password = ConvertTo-SecureString -String $($secret.password) -AsPlainText -Force
-    {copy_s3_command}
-    {configure_job_users}
-}} catch {{
-    $_ | Out-File "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}"
-    cat "C:\\ProgramData\\Amazon\\EC2-Windows\\Launch\\Log\\UserdataExecution.log" >> "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}"
-    exit 1
-}}
-
-New-Item -Path "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME}" -ItemType File -Force
-
-</powershell>"""
-
-        return userdata
-
-    def ami_ssm_param_name(self) -> str:
-        # Grab the latest Windows Server 2022 AMI
-        # https://aws.amazon.com/blogs/mt/query-for-the-latest-windows-ami-using-systems-manager-parameter-store/
-        ami_ssm_param: str = (
-            f"/aws/service/ami-windows-latest/{WindowsInstanceBuildWorker.WIN2022_AMI_NAME}"
-        )
-        return ami_ssm_param
-
 
 @dataclass
 class PosixInstanceWorkerBase(EC2InstanceWorker):
-    """Base class from which posix (i.e. Linux) ec2 test instances are derived.
-
-    The methods in this base class are written with two cases of worker hosts in mind:
-    1. A host that is based on a stock linux AMI, with no Deadline-anything installed, that
-       must install the worker agent and the like during boot-up.
-    2. A host that already has the worker agent, job/agent users, and the like baked into
-       the host AMI in a location & manner that may differ from case (1).
     """
+    Base class for POSIX EC2 workers.
 
-    SIGNAL_USER_DATA_SUCCESS_DIR: ClassVar[str] = "/var/tmp/signal_user_data_finished"
-    SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME: ClassVar[str] = f"{SIGNAL_USER_DATA_SUCCESS_DIR}/success"
-    SIGNAL_USER_DATA_FAILED_FILE_NAME: ClassVar[str] = f"{SIGNAL_USER_DATA_SUCCESS_DIR}/failed"
+    Args:
+        configuration: Worker agent configuration
+        worker_host: PosixEC2WorkerHost to use (required)
+
+    Example:
+        >>> host = PosixEC2WorkerHost(subnet_id="...", security_group_id="...", ...)
+        >>> host.start()
+        >>> worker = PosixInstanceBuildWorker(configuration=config, worker_host=host)
+        >>> worker.start()
+    """
 
     def _required_host_os(self) -> str:
         """POSIX workers require POSIX hosts."""
         return "posix"
-
-    def ebs_devices(self) -> dict[str, int] | None:
-        """DeviceName -> VolumeSize (in GiBs) mapping"""
-        # defaults to 30GB to match SMF, aws gives 8GB by default
-        return {"/dev/xvda": 30}
-
-    def ssm_document_name(self) -> str:
-        return "AWS-RunShellScript"
 
     def send_command(
         self, command: str, ssm_waiter_config: dict[str, int] = DEFAULT_WAITER_CONFIG
@@ -909,23 +800,60 @@ class PosixInstanceWorkerBase(EC2InstanceWorker):
             except Exception as e:
                 LOG.warning(f"Failed to clean up agent state: {e}")
 
-    def _setup_worker_agent(self) -> None:
-        assert self.instance_id
-        LOG.info(
-            f"Starting worker for farm: {self.configuration.farm_id} and fleet: {self.configuration.fleet.id}"
-        )
-        LOG.info(f"Sending SSM command to configure Worker agent on instance {self.instance_id}")
+    # Abstract methods that subclasses must implement
+    @abc.abstractmethod
+    def configure_worker_command(self, *, config: DeadlineWorkerConfiguration) -> str:
+        """Generate the command to configure the worker agent."""
+        pass
 
-        cmd_result = self.send_command(self.configure_worker_command(config=self.configuration))
-        assert cmd_result.exit_code == 0, f"Failed to configure Worker agent: {cmd_result}"
-        LOG.info("Successfully configured Worker agent")
+    # Public methods for worker agent management
+    def start_worker_service(self) -> None:
+        """Start the worker agent systemd service."""
+        LOG.info("Sending command to start the Worker Agent service")
 
-        if self.configuration.start_service:
-            LOG.info(
-                f"Sending SSM command to configure Worker agent on instance {self.instance_id}"
+        cmd_result = self.send_command(
+            " && ".join(
+                [
+                    "systemctl start deadline-worker",
+                    "sleep 5",
+                    "systemctl is-active deadline-worker",
+                    "if test $? -ne 0; then echo '+++AGENT NOT RUNNING+++'; cat /var/log/amazon/deadline/worker-agent-bootstrap.log /var/log/amazon/deadline/worker-agent.log; exit 1; fi",
+                ]
             )
-            self.start_worker_service()
-            LOG.info("Successfully started worker agent")
+        )
+
+        assert cmd_result.exit_code == 0, f"Failed to start Worker Agent service: {cmd_result}"
+
+        self.worker_id = self.get_worker_id()
+
+    def stop_worker_service(self) -> None:
+        """Stop the worker agent systemd service."""
+        LOG.info("Sending command to stop the Worker Agent service")
+        cmd_result = self.send_command("systemctl stop deadline-worker")
+
+        assert cmd_result.exit_code == 0, f"Failed to stop Worker Agent service: {cmd_result}"
+
+    def get_worker_id(self) -> str:
+        """Retrieve the worker ID from the worker agent."""
+        # There can be a race condition, so we may need to wait a little bit for the status file to be written.
+
+        worker_state_filename = "/var/lib/deadline/worker.json"
+        cmd_result = self.send_command(
+            " && ".join(
+                [
+                    f"t=0 && while [ $t -le 10 ] && ! (test -f {worker_state_filename}); do sleep $t; t=$[$t+1]; done",
+                    f"cat {worker_state_filename} | jq -r '.worker_id'",
+                ]
+            )
+        )
+        assert cmd_result.exit_code == 0, f"Failed to get Worker ID: {cmd_result}"
+
+        worker_id = cmd_result.stdout.rstrip("\n\r")
+        LOG.info(f"Worker ID: {worker_id}")
+        assert re.match(
+            r"^worker-[0-9a-f]{32}$", worker_id
+        ), f"Got nonvalid Worker ID from command stdout: {cmd_result}"
+        return worker_id
 
     def configure_agent_user_environment(
         self, config: DeadlineWorkerConfiguration
@@ -983,51 +911,6 @@ class PosixInstanceWorkerBase(EC2InstanceWorker):
 
         return " && ".join(cmds)
 
-    def start_worker_service(self):
-        LOG.info("Sending command to start the Worker Agent service")
-
-        cmd_result = self.send_command(
-            " && ".join(
-                [
-                    "systemctl start deadline-worker",
-                    "sleep 5",
-                    "systemctl is-active deadline-worker",
-                    "if test $? -ne 0; then echo '+++AGENT NOT RUNNING+++'; cat /var/log/amazon/deadline/worker-agent-bootstrap.log /var/log/amazon/deadline/worker-agent.log; exit 1; fi",
-                ]
-            )
-        )
-
-        assert cmd_result.exit_code == 0, f"Failed to start Worker Agent service: {cmd_result}"
-
-        self.worker_id = self.get_worker_id()
-
-    def stop_worker_service(self):
-        LOG.info("Sending command to stop the Worker Agent service")
-        cmd_result = self.send_command("systemctl stop deadline-worker")
-
-        assert cmd_result.exit_code == 0, f"Failed to stop Worker Agent service: {cmd_result}"
-
-    def get_worker_id(self) -> str:
-        # There can be a race condition, so we may need to wait a little bit for the status file to be written.
-
-        worker_state_filename = "/var/lib/deadline/worker.json"
-        cmd_result = self.send_command(
-            " && ".join(
-                [
-                    f"t=0 && while [ $t -le 10 ] && ! (test -f {worker_state_filename}); do sleep $t; t=$[$t+1]; done",
-                    f"cat {worker_state_filename} | jq -r '.worker_id'",
-                ]
-            )
-        )
-        assert cmd_result.exit_code == 0, f"Failed to get Worker ID: {cmd_result}"
-
-        worker_id = cmd_result.stdout.rstrip("\n\r")
-        LOG.info(f"Worker ID: {worker_id}")
-        assert re.match(
-            r"^worker-[0-9a-f]{32}$", worker_id
-        ), f"Got nonvalid Worker ID from command stdout: {cmd_result}"
-        return worker_id
-
 
 @dataclass
 class PosixInstanceBuildWorker(PosixInstanceWorkerBase):
@@ -1035,8 +918,6 @@ class PosixInstanceBuildWorker(PosixInstanceWorkerBase):
     This class represents a Linux EC2 Worker Host.
     Any commands must be written in Bash.
     """
-
-    AL2023_AMI_NAME: ClassVar[str] = "al2023-ami-kernel-6.1-x86_64"
 
     def configure_worker_command(
         self, config: DeadlineWorkerConfiguration
@@ -1086,69 +967,6 @@ class PosixInstanceBuildWorker(PosixInstanceWorkerBase):
         cmds.append(self.configure_agent_user_environment(config))
 
         return " && ".join(cmds)
-
-    def userdata_success_script(self) -> str:
-        return f"""
-if [[ -f "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME}" ]]; then
-    echo "{self.USERDATA_SUCCESS_STRING}"
-    exit 0
-fi
-if [[ -f "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}" ]]; then
-    echo "{self.USERDATA_FAILURE_STRING}"
-    cat "{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}"
-    exit 0
-fi
-"""
-
-    def userdata(self, s3_files) -> str:
-        copy_s3_command = ""
-        job_users_cmds = []
-
-        if s3_files:
-            copy_s3_command = " && ".join(
-                [f"aws s3 cp {s3_uri} {dst} && chmod o+rx {dst}" for s3_uri, dst in s3_files]
-            )
-        for job_user in self.configuration.job_users:
-            job_users_cmds.append(f"groupadd -f {job_user.group}")
-            job_users_cmds.append(
-                f"useradd --create-home --system --shell=/bin/bash --groups={self.configuration.job_user_group} -g {job_user.group} {job_user.user}"
-            )
-
-        configure_job_users = "\n".join(job_users_cmds)
-
-        userdata = f"""#!/bin/bash
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-set -euxo pipefail
-success_dir="{self.SIGNAL_USER_DATA_SUCCESS_DIR}"
-mkdir $success_dir -p
-
-signal_failure() {{
-    failure_file="{self.SIGNAL_USER_DATA_FAILED_FILE_NAME}"
-    cat /var/log/cloud-init-output.log > $failure_file
-    exit 1
-}}
-
-trap signal_failure ERR
-
-groupadd -f --system {self.configuration.job_user_group}
-{configure_job_users}
-{copy_s3_command}
-
-mkdir /opt/deadline
-python3 -m venv /opt/deadline/worker
-
-touch "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE_NAME}"
-"""
-
-        return userdata
-
-    def ami_ssm_param_name(self) -> str:
-        # Grab the latest AL2023 AMI
-        # https://aws.amazon.com/blogs/compute/query-for-the-latest-amazon-linux-ami-ids-using-aws-systems-manager-parameter-store/
-        ami_ssm_param: str = (
-            f"/aws/service/ami-amazon-linux-latest/{PosixInstanceBuildWorker.AL2023_AMI_NAME}"
-        )
-        return ami_ssm_param
 
 
 @dataclass

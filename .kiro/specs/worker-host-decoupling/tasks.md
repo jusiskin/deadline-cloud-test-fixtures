@@ -84,7 +84,7 @@
   - _Requirements: 1.2, 2.2, 2.4, 2.5_
   - _Validates: Requirements 2.4, 4.4, 4.2_
 
-- [ ] 6. Refactor both WindowsInstanceWorkerBase and PosixInstanceWorkerBase for agent-only operations
+- [x] 6. Refactor both WindowsInstanceWorkerBase and PosixInstanceWorkerBase for agent-only operations
   - Update `WindowsInstanceWorkerBase` to use `WindowsEC2WorkerHost`
   - Update `PosixInstanceWorkerBase` to use `PosixEC2WorkerHost`
   - Implement `_required_host_os()` to return "windows" and "posix" respectively
@@ -93,7 +93,7 @@
   - **Simultaneously update any affected tests to maintain passing status**
   - _Requirements: 4.3, 4.4, 7.2, 7.3_
 
-- [ ] 6.1 Write property test for OS-agnostic agent operations
+- [x] 6.1 Write property test for OS-agnostic agent operations
   - **Property 13: Operating system-agnostic worker agent operations**
   - **Validates: Requirements 7.4**
 
