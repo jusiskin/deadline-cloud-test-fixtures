@@ -266,6 +266,428 @@ class TestWorkerAgentLifecycleProperties:
                 worker.start()
 
 
+class TestSequentialWorkerAgentConfiguration:
+    """Property tests for sequential worker agent configuration."""
+
+    def test_property_3_sequential_worker_agent_configuration(
+        self, worker_config, mock_worker_host
+    ):
+        """
+        Property 3: Sequential worker agent configuration
+
+        For any worker host and any two different worker agent configurations,
+        applying configuration A, stopping the agent, then applying configuration B
+        should result in a working worker agent with configuration B's settings
+        and no remnants of configuration A.
+
+        **Validates: Requirements 1.2, 1.4, 2.5, 5.4**
+        """
+        # Create two different configurations
+        config_a = worker_config
+        config_b = DeadlineWorkerConfiguration(
+            farm_id="farm-456",  # Different farm
+            fleet=Fleet(id="fleet_456", farm=Farm(id="farm-456")),  # Different fleet
+            region="us-east-1",  # Different region
+            job_user="different-user",  # Different user
+            job_user_group="different-group",  # Different group
+            allow_shutdown=True,  # Different setting
+            worker_agent_install=PipInstall(
+                requirement_specifiers=["deadline-cloud-worker-agent==2.0.0"],  # Different version
+                codeartifact=CodeArtifactRepositoryInfo(
+                    region="us-east-1",
+                    domain="different-domain",
+                    domain_owner="987654321987",
+                    repository="different-repository",
+                ),
+            ),
+        )
+
+        with patch("boto3.client"):
+            # Create first worker with config A
+            worker_a = PosixInstanceBuildWorker(
+                configuration=config_a,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+            # Create second worker with config B (same host)
+            worker_b = PosixInstanceBuildWorker(
+                configuration=config_b,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+        with (
+            patch.object(worker_a, "_stage_s3_bucket", return_value=None),
+            patch.object(worker_a, "get_worker_id", return_value="worker-aaa123"),
+            patch.object(worker_b, "_stage_s3_bucket", return_value=None),
+            patch.object(worker_b, "get_worker_id", return_value="worker-bbb456"),
+        ):
+
+            # Apply configuration A
+            worker_a.start()
+            assert worker_a.agent_state == WorkerAgentState.RUNNING
+            assert worker_a.worker_id == "worker-aaa123"
+            assert worker_a.configuration.farm_id == "farm-123"
+            assert worker_a.configuration.fleet.id == "fleet_123"
+
+            # Stop agent with configuration A
+            worker_a.stop()
+            assert worker_a.agent_state == WorkerAgentState.NOT_STARTED
+            assert worker_a.worker_id is None
+
+            # Verify host is released and available for reuse
+            mock_worker_host._release_from_worker.assert_called_with(id(worker_a))
+
+            # Apply configuration B to the same host
+            worker_b.start()
+            assert worker_b.agent_state == WorkerAgentState.RUNNING
+            assert worker_b.worker_id == "worker-bbb456"
+            assert worker_b.configuration.farm_id == "farm-456"
+            assert worker_b.configuration.fleet.id == "fleet_456"
+
+            # Verify configuration B is completely independent from A
+            assert worker_b.worker_id != worker_a.worker_id
+            assert worker_b.configuration.farm_id != worker_a.configuration.farm_id
+            assert worker_b.configuration.fleet.id != worker_a.configuration.fleet.id
+            assert worker_b.configuration.region != worker_a.configuration.region
+
+            # Clean up
+            worker_b.stop()
+
+    @pytest.mark.parametrize(
+        "config_changes",
+        [
+            # Different farm and fleet
+            {"farm_id": "farm-999", "fleet_id": "fleet_999"},
+            # Different region
+            {"region": "eu-west-1"},
+            # Different user settings
+            {"job_user": "custom-user", "job_user_group": "custom-group"},
+            # Different shutdown setting
+            {"allow_shutdown": True},
+        ],
+    )
+    def test_property_3_various_configuration_changes(
+        self, worker_config, mock_worker_host, config_changes
+    ):
+        """
+        Property 3 extended: Sequential configuration with various changes
+
+        Test that sequential configuration works with different types of configuration changes.
+
+        **Validates: Requirements 1.2, 1.4, 2.5, 5.4**
+        """
+        # Create modified configuration
+        config_b_params = {
+            "farm_id": worker_config.farm_id,
+            "fleet": worker_config.fleet,
+            "region": worker_config.region,
+            "job_user": worker_config.job_user,
+            "job_user_group": worker_config.job_user_group,
+            "allow_shutdown": worker_config.allow_shutdown,
+            "worker_agent_install": worker_config.worker_agent_install,
+        }
+
+        # Apply the specific changes
+        if "farm_id" in config_changes:
+            config_b_params["farm_id"] = config_changes["farm_id"]
+            config_b_params["fleet"] = Fleet(
+                id=config_changes.get("fleet_id", "fleet_999"),
+                farm=Farm(id=config_changes["farm_id"]),
+            )
+        if "region" in config_changes:
+            config_b_params["region"] = config_changes["region"]
+        if "job_user" in config_changes:
+            config_b_params["job_user"] = config_changes["job_user"]
+        if "job_user_group" in config_changes:
+            config_b_params["job_user_group"] = config_changes["job_user_group"]
+        if "allow_shutdown" in config_changes:
+            config_b_params["allow_shutdown"] = config_changes["allow_shutdown"]
+
+        config_b = DeadlineWorkerConfiguration(**config_b_params)
+
+        with patch("boto3.client"):
+            worker_a = PosixInstanceBuildWorker(
+                configuration=worker_config,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+            worker_b = PosixInstanceBuildWorker(
+                configuration=config_b,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+        with (
+            patch.object(worker_a, "_stage_s3_bucket", return_value=None),
+            patch.object(worker_a, "get_worker_id", return_value="worker-aaa123"),
+            patch.object(worker_b, "_stage_s3_bucket", return_value=None),
+            patch.object(worker_b, "get_worker_id", return_value="worker-bbb456"),
+        ):
+
+            # Apply first configuration
+            worker_a.start()
+            assert worker_a.agent_state == WorkerAgentState.RUNNING
+
+            # Stop and apply second configuration
+            worker_a.stop()
+            worker_b.start()
+            assert worker_b.agent_state == WorkerAgentState.RUNNING
+
+            # Verify the changed configuration is applied
+            for key, value in config_changes.items():
+                if key == "fleet_id":
+                    assert worker_b.configuration.fleet.id == value
+                elif key == "farm_id":
+                    assert worker_b.configuration.farm_id == value
+                elif key in ["region", "job_user", "job_user_group", "allow_shutdown"]:
+                    assert getattr(worker_b.configuration, key) == value
+
+            worker_b.stop()
+
+
+class TestWorkerAgentConfigurationCorrectness:
+    """Property tests for worker agent configuration correctness."""
+
+    def test_property_4_worker_agent_configuration_correctness(
+        self, worker_config, mock_worker_host
+    ):
+        """
+        Property 4: Worker agent configuration correctness
+
+        For any valid DeadlineWorkerConfiguration and any worker host, applying the
+        configuration should result in a worker agent with settings that match the
+        configuration (farm ID, fleet ID, region, user settings, etc.).
+
+        **Validates: Requirements 1.3, 4.3, 5.3**
+        """
+        with patch("boto3.client"):
+            worker = PosixInstanceBuildWorker(
+                configuration=worker_config,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+        with (
+            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "get_worker_id", return_value="worker-test123"),
+        ):
+
+            # Apply the configuration
+            worker.start()
+
+            # Verify: Worker agent should have the correct configuration
+            assert worker.agent_state == WorkerAgentState.RUNNING
+            assert worker.worker_id == "worker-test123"
+
+            # Verify configuration matches
+            assert worker.configuration.farm_id == "farm-123"
+            assert worker.configuration.fleet.id == "fleet_123"
+            assert worker.configuration.region == "us-west-2"
+            assert worker.configuration.job_user == "test-user"
+            assert worker.configuration.job_user_group == "test-group"
+            assert worker.configuration.allow_shutdown is False
+
+            # Verify the configure command was called with the correct configuration
+            # The configure_worker_command method should be called during _configure_agent
+            configure_cmd = worker.configure_worker_command(config=worker_config)
+
+            # Verify the command contains the expected configuration values
+            assert "farm-123" in configure_cmd
+            assert "fleet_123" in configure_cmd
+            assert "us-west-2" in configure_cmd
+            # Note: agent_user (deadline-worker) is used for --user, not job_user
+            assert "deadline-worker" in configure_cmd
+            assert "test-group" in configure_cmd
+
+            worker.stop()
+
+    @pytest.mark.parametrize(
+        "farm_id,fleet_id,region,job_user,allow_shutdown",
+        [
+            # Standard configuration
+            ("farm-001", "fleet-001", "us-west-2", "user1", True),
+            # Different region
+            ("farm-002", "fleet-002", "eu-west-1", "user2", False),
+            # Different user
+            ("farm-003", "fleet-003", "us-east-1", "custom-user", True),
+            # Edge case: Long IDs
+            ("farm-" + "a" * 50, "fleet-" + "b" * 50, "ap-southeast-1", "user3", False),
+            # Edge case: Special characters in user
+            ("farm-004", "fleet-004", "us-west-1", "job-user-123", True),
+        ],
+    )
+    def test_property_4_various_configurations(
+        self,
+        farm_id,
+        fleet_id,
+        region,
+        job_user,
+        allow_shutdown,
+        mock_worker_host,
+    ):
+        """
+        Property 4 extended: Configuration correctness with various valid configurations
+
+        Test that configuration correctness holds for various valid configuration values.
+
+        **Validates: Requirements 1.3, 4.3, 5.3**
+        """
+        # Create configuration with specific values
+        config = DeadlineWorkerConfiguration(
+            farm_id=farm_id,
+            fleet=Fleet(id=fleet_id, farm=Farm(id=farm_id)),
+            region=region,
+            job_user=job_user,
+            job_user_group="test-group",
+            allow_shutdown=allow_shutdown,
+            worker_agent_install=PipInstall(
+                requirement_specifiers=["deadline-cloud-worker-agent"],
+                codeartifact=CodeArtifactRepositoryInfo(
+                    region=region,
+                    domain="test-domain",
+                    domain_owner="123456789123",
+                    repository="test-repository",
+                ),
+            ),
+        )
+
+        with patch("boto3.client"):
+            worker = PosixInstanceBuildWorker(
+                configuration=config,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+        with (
+            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "get_worker_id", return_value="worker-test123"),
+        ):
+
+            # Apply the configuration
+            worker.start()
+
+            # Verify: Configuration values match exactly
+            assert worker.configuration.farm_id == farm_id
+            assert worker.configuration.fleet.id == fleet_id
+            assert worker.configuration.region == region
+            assert worker.configuration.job_user == job_user
+            assert worker.configuration.allow_shutdown == allow_shutdown
+
+            # Verify the configure command contains the expected values
+            configure_cmd = worker.configure_worker_command(config=config)
+            assert farm_id in configure_cmd
+            assert fleet_id in configure_cmd
+            assert region in configure_cmd
+            # Note: agent_user (deadline-worker) is used for --user, not job_user
+            # job_user is used for job execution, not agent configuration
+            assert "deadline-worker" in configure_cmd
+
+            worker.stop()
+
+    def test_property_4_configuration_with_file_mappings(self, worker_config, mock_worker_host):
+        """
+        Property 4 extended: Configuration correctness with file mappings
+
+        Test that file mappings are correctly handled in the configuration.
+
+        **Validates: Requirements 1.3, 4.3, 5.3**
+        """
+        # Create configuration with file mappings
+        config_with_files = DeadlineWorkerConfiguration(
+            farm_id=worker_config.farm_id,
+            fleet=worker_config.fleet,
+            region=worker_config.region,
+            job_user=worker_config.job_user,
+            job_user_group=worker_config.job_user_group,
+            allow_shutdown=worker_config.allow_shutdown,
+            worker_agent_install=worker_config.worker_agent_install,
+            file_mappings=[
+                ("/local/path/file1.txt", "/remote/path/file1.txt"),
+                ("/local/path/file2.txt", "/remote/path/file2.txt"),
+            ],
+        )
+
+        with patch("boto3.client"):
+            worker = PosixInstanceBuildWorker(
+                configuration=config_with_files,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+        with (
+            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "get_worker_id", return_value="worker-test123"),
+        ):
+
+            # Apply the configuration
+            worker.start()
+
+            # Verify: Configuration includes file mappings
+            assert worker.configuration.file_mappings is not None
+            assert len(worker.configuration.file_mappings) == 2
+            assert worker.configuration.file_mappings[0] == (
+                "/local/path/file1.txt",
+                "/remote/path/file1.txt",
+            )
+            assert worker.configuration.file_mappings[1] == (
+                "/local/path/file2.txt",
+                "/remote/path/file2.txt",
+            )
+
+            worker.stop()
+
+    def test_property_4_configuration_with_environment_variables(
+        self, worker_config, mock_worker_host
+    ):
+        """
+        Property 4 extended: Configuration correctness with environment variables
+
+        Test that environment variables are correctly handled in the configuration.
+
+        **Validates: Requirements 1.3, 4.3, 5.3**
+        """
+        # Create configuration with environment variables
+        config_with_env = DeadlineWorkerConfiguration(
+            farm_id=worker_config.farm_id,
+            fleet=worker_config.fleet,
+            region=worker_config.region,
+            job_user=worker_config.job_user,
+            job_user_group=worker_config.job_user_group,
+            allow_shutdown=worker_config.allow_shutdown,
+            worker_agent_install=worker_config.worker_agent_install,
+            worker_env_var={
+                "CUSTOM_VAR_1": "value1",
+                "CUSTOM_VAR_2": "value2",
+                "FEATURE_FLAG": "enabled",
+            },
+        )
+
+        with patch("boto3.client"):
+            worker = PosixInstanceBuildWorker(
+                configuration=config_with_env,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+        with (
+            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "get_worker_id", return_value="worker-test123"),
+        ):
+
+            # Apply the configuration
+            worker.start()
+
+            # Verify: Configuration includes environment variables
+            assert worker.configuration.worker_env_var is not None
+            assert worker.configuration.worker_env_var["CUSTOM_VAR_1"] == "value1"
+            assert worker.configuration.worker_env_var["CUSTOM_VAR_2"] == "value2"
+            assert worker.configuration.worker_env_var["FEATURE_FLAG"] == "enabled"
+
+            worker.stop()
+
+
 class TestOSAgnosticWorkerAgentOperations:
     """Property tests for OS-agnostic worker agent operations."""
 

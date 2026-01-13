@@ -97,7 +97,7 @@
   - **Property 13: Operating system-agnostic worker agent operations**
   - **Validates: Requirements 7.4**
 
-- [ ] 7. Update concrete worker classes and add property tests
+- [x] 7. Update concrete worker classes and add property tests
   - Update `WindowsInstanceBuildWorker` to work with new architecture
   - Update `PosixInstanceBuildWorker` to work with new architecture
   - Ensure `configure_worker_command()` methods work with WorkerHost delegation
@@ -107,7 +107,7 @@
   - _Requirements: 7.1, 7.2, 7.3_
   - _Validates: Requirements 1.2, 1.4, 2.5, 5.4, 1.3, 4.3, 5.3_
 
-- [ ] 8. Checkpoint - Verify all tests still pass
+- [x] 8. Checkpoint - Verify all tests still pass
   - Run full test suite to verify no regressions were introduced
   - All tests should already be passing due to simultaneous test updates in previous tasks
 
