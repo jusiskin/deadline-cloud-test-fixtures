@@ -4,8 +4,11 @@ from __future__ import annotations
 import abc
 import botocore.client
 import botocore.exceptions
+import glob
 import json
 import logging
+import os
+import shlex
 
 from dataclasses import dataclass, field, InitVar
 from enum import Enum
@@ -593,6 +596,103 @@ class EC2WorkerHost(WorkerHost):
             diagnostic_info.append(f"Failed to get instance status: {e}")
         return "\n".join(diagnostic_info)
 
+    def transfer_files(
+        self, file_mappings: list[tuple[str, str]], s3_key_prefix: str = "worker"
+    ) -> None:
+        """
+        Transfer files from local machine to the EC2 instance.
+
+        This method handles the complete file transfer process:
+        1. Uploads files from local machine to S3 (staging)
+        2. Uses SSM to download files from S3 to the EC2 instance
+
+        Args:
+            file_mappings: List of (source_glob, destination_path) tuples where:
+                - source_glob: Local file path or glob pattern
+                - destination_path: Destination path on the EC2 instance
+            s3_key_prefix: Prefix for S3 keys (default: "worker")
+
+        Raises:
+            AssertionError: If duplicate S3 keys would be generated
+            botocore.exceptions.ClientError: If S3 upload fails
+            RuntimeError: If file download to EC2 instance fails
+        """
+        if not file_mappings:
+            LOG.info("No file mappings to transfer")
+            return
+
+        # Step 1: Upload files to S3
+        s3_to_src_mapping: dict[str, str] = {}
+        s3_to_dst_mapping: dict[str, str] = {}
+
+        for src_glob, dst in file_mappings:
+            for src_file in glob.glob(src_glob):
+                s3_key = f"{s3_key_prefix}/{os.path.basename(src_file)}"
+                assert s3_key not in s3_to_src_mapping, (
+                    "Duplicate S3 keys generated for file mappings. All source files must have unique "
+                    + f"filenames. Mapping: {file_mappings}"
+                )
+                s3_to_src_mapping[s3_key] = src_file
+                s3_to_dst_mapping[f"s3://{self.bootstrap_bucket_name}/{s3_key}"] = dst
+
+        for key, local_path in s3_to_src_mapping.items():
+            LOG.info(f"Uploading file {local_path} to s3://{self.bootstrap_bucket_name}/{key}")
+            try:
+                with open(local_path, mode="rb") as f:
+                    self.s3_client.put_object(
+                        Bucket=self.bootstrap_bucket_name,
+                        Key=key,
+                        Body=f,
+                    )
+            except botocore.exceptions.ClientError as e:
+                LOG.exception(
+                    f"Failed to upload file {local_path} to s3://{self.bootstrap_bucket_name}/{key}: {e}"
+                )
+                raise
+
+        # Step 2: Download files from S3 to EC2 instance
+        s3_to_dst_list = list(s3_to_dst_mapping.items())
+        if s3_to_dst_list:
+            LOG.info(f"Transferring {len(s3_to_dst_list)} files from S3 to EC2 instance")
+            download_command = self._get_download_files_command(s3_to_dst_list)
+            result = self.send_command(download_command)
+            if result.exit_code != 0:
+                raise RuntimeError(f"Failed to download files from S3 to EC2 instance: {result}")
+            LOG.info(f"Successfully transferred {len(s3_to_dst_list)} files to EC2 instance")
+
+    @abc.abstractmethod
+    def _get_download_files_command(self, s3_files: list[tuple[str, str]]) -> str:
+        """Get the OS-specific command to download files from S3 to the instance."""
+        pass
+
+    @abc.abstractmethod
+    def _get_remove_files_command(self, file_paths: list[str]) -> str:
+        """Get the OS-specific command to remove multiple files in a single command."""
+        pass
+
+    def cleanup_files(self, file_paths: list[str]) -> None:
+        """
+        Clean up files from the worker host.
+
+        Args:
+            file_paths: List of file paths to remove from the host
+
+        Note:
+            This method uses a single SSM command to remove all files for efficiency.
+            Failures are logged as warnings but do not raise exceptions.
+        """
+        if not file_paths:
+            LOG.info("No files to clean up")
+            return
+
+        LOG.info(f"Cleaning up {len(file_paths)} files from worker host")
+        try:
+            cleanup_command = self._get_remove_files_command(file_paths)
+            self.send_command(cleanup_command)
+            LOG.info(f"Successfully removed {len(file_paths)} files")
+        except Exception as e:
+            LOG.warning(f"Failed to remove files: {e}")
+
 
 @dataclass
 class WindowsEC2WorkerHost(EC2WorkerHost):
@@ -678,6 +778,19 @@ try {{
 </powershell>"""
 
         return userdata
+
+    def _get_download_files_command(self, s3_files: list[tuple[str, str]]) -> str:
+        """Get the Windows PowerShell command to download files from S3."""
+        # Build a PowerShell command that downloads all files from S3
+        download_commands = [f"aws s3 cp {s3_uri} {dst}" for s3_uri, dst in s3_files]
+        return " ; ".join(download_commands)
+
+    def _get_remove_files_command(self, file_paths: list[str]) -> str:
+        """Get the Windows PowerShell command to remove multiple files in a single command."""
+        # Build a PowerShell command that removes all files
+        # Use ForEach-Object to iterate through the paths and remove each one
+        paths_array = ", ".join([f'"{path}"' for path in file_paths])
+        return f"@({paths_array}) | ForEach-Object {{ Remove-Item -Path $_ -Force -ErrorAction SilentlyContinue }}"
 
 
 @dataclass
@@ -769,3 +882,18 @@ echo "Userdata completed successfully" > "{self.SIGNAL_USER_DATA_SUCCESSFUL_FILE
 """
 
         return userdata
+
+    def _get_download_files_command(self, s3_files: list[tuple[str, str]]) -> str:
+        """Get the POSIX shell command to download files from S3."""
+        # Build a shell command that downloads all files from S3
+        # Use && to chain commands so we fail fast if any download fails
+        download_commands = [
+            f"aws s3 cp {shlex.quote(s3_uri)} {shlex.quote(dst)} && chmod o+rx {shlex.quote(dst)}"
+            for s3_uri, dst in s3_files
+        ]
+        return " && ".join(download_commands)
+
+    def _get_remove_files_command(self, file_paths: list[str]) -> str:
+        """Get the POSIX shell command to remove multiple files in a single command."""
+        # Use shlex.join to properly quote file paths for shell safety
+        return f"rm -f {shlex.join(file_paths)}"

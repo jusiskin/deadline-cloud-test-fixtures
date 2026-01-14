@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import abc
-import glob
 import json
 import logging
 import os
@@ -219,7 +218,7 @@ class EC2InstanceWorker(DeadlineWorker):
         pass
 
     @abc.abstractmethod
-    def _install_agent(self, s3_files: list[tuple[str, str]] | None = None) -> None:
+    def _install_agent(self) -> None:
         """Install worker agent software (OS-specific)."""
         pass
 
@@ -243,41 +242,24 @@ class EC2InstanceWorker(DeadlineWorker):
         """Clean up worker agent state files (OS-specific)."""
         pass
 
-    def _stage_s3_bucket(self) -> list[tuple[str, str]] | None:
-        """Stages file_mappings to an S3 bucket and returns the mapping of S3 URI to dest path"""
+    def _transfer_files(self) -> None:
+        """Transfer file_mappings from local machine to the EC2 instance."""
         if not self.configuration.file_mappings:
-            LOG.info("No file mappings to stage to S3")
-            return None
+            return
 
-        s3_to_src_mapping: dict[str, str] = {}
-        s3_to_dst_mapping: dict[str, str] = {}
-        for src_glob, dst in self.configuration.file_mappings:
-            for src_file in glob.glob(src_glob):
-                s3_key = f"worker/{os.path.basename(src_file)}"
-                assert s3_key not in s3_to_src_mapping, (
-                    "Duplicate S3 keys generated for file mappings. All source files must have unique "
-                    + f"filenames. Mapping: {self.configuration.file_mappings}"
-                )
-                s3_to_src_mapping[s3_key] = src_file
-                s3_to_dst_mapping[f"s3://{self.bootstrap_bucket_name}/{s3_key}"] = dst
+        # Delegate to worker_host for complete file transfer (local -> S3 -> EC2)
+        self.worker_host.transfer_files(self.configuration.file_mappings)
 
-        for key, local_path in s3_to_src_mapping.items():
-            LOG.info(f"Uploading file {local_path} to s3://{self.bootstrap_bucket_name}/{key}")
-            try:
-                # self.s3_client.upload_file(local_path, self.bootstrap_bucket_name, key)
-                with open(local_path, mode="rb") as f:
-                    self.s3_client.put_object(
-                        Bucket=self.bootstrap_bucket_name,
-                        Key=key,
-                        Body=f,
-                    )
-            except botocore.exceptions.ClientError as e:
-                LOG.exception(
-                    f"Failed to upload file {local_path} to s3://{self.bootstrap_bucket_name}/{key}: {e}"
-                )
-                raise
+    def _cleanup_files(self) -> None:
+        """Clean up files that were staged for this worker agent."""
+        if not self.configuration.file_mappings:
+            return
 
-        return list(s3_to_dst_mapping.items())
+        # Collect all destination file paths
+        file_paths = [dst_path for _, dst_path in self.configuration.file_mappings]
+
+        # Delegate to worker_host for file cleanup
+        self.worker_host.cleanup_files(file_paths)
 
     def _delete_worker(self) -> None:
         """Delete the worker from Deadline Cloud service."""
@@ -351,11 +333,11 @@ class EC2InstanceWorker(DeadlineWorker):
         # Claim the host for this worker (raises if another worker is using it)
         self.worker_host._claim_for_worker(id(self))
 
-        # Stage files to S3 for worker agent configuration
-        s3_files = self._stage_s3_bucket()
+        # Transfer files from local machine to EC2 instance
+        self._transfer_files()
 
         # Install, configure, and start the worker agent
-        self._install_agent(s3_files)
+        self._install_agent()
         self._configure_agent()
         self._start_agent_service()
         self.worker_id = self.get_worker_id()
@@ -368,9 +350,10 @@ class EC2InstanceWorker(DeadlineWorker):
         This method performs complete worker agent teardown:
         1. Stop the worker agent service
         2. Remove worker agent state files (worker.json, configuration files, etc.)
-        3. Delete the worker from Deadline Cloud service
-        4. Clear the worker ID
-        5. Release the worker host so other workers can use it
+        3. Clean up staged files from file_mappings
+        4. Delete the worker from Deadline Cloud service
+        5. Clear the worker ID
+        6. Release the worker host so other workers can use it
 
         After this method completes, the host is ready for a new worker agent configuration.
         """
@@ -381,6 +364,7 @@ class EC2InstanceWorker(DeadlineWorker):
         if self.worker_id:
             self._stop_agent_service()
             self._cleanup_agent_state()
+            self._cleanup_files()
             self._delete_worker()
             self.worker_id = None
 
@@ -514,7 +498,7 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
         """Delegate to worker host with Windows-specific command handling."""
         return self.worker_host.send_command(command, ssm_waiter_config)
 
-    def _install_agent(self, s3_files: list[tuple[str, str]] | None = None) -> None:
+    def _install_agent(self) -> None:
         """Install worker agent software on Windows."""
         # Installation is handled in _configure_agent for Windows
         pass
@@ -756,7 +740,7 @@ class PosixInstanceWorkerBase(EC2InstanceWorker):
         """Delegate to worker host with POSIX-specific command prefix."""
         return self.worker_host.send_command(command, ssm_waiter_config)
 
-    def _install_agent(self, s3_files: list[tuple[str, str]] | None = None) -> None:
+    def _install_agent(self) -> None:
         """Install worker agent software on POSIX."""
         # Installation is handled in _configure_agent for POSIX
         pass

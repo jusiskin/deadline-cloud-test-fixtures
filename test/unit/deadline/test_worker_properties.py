@@ -2,6 +2,7 @@
 """Property-based tests for worker host decoupling."""
 
 import pytest
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from deadline_test_fixtures.deadline.worker import PosixInstanceBuildWorker
@@ -92,7 +93,7 @@ class TestWorkerAgentLifecycleProperties:
         mock_worker_host.is_running.return_value = True
 
         with (
-            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "_transfer_files", return_value=None),
             patch.object(worker, "get_worker_id", return_value="worker-test123"),
         ):
 
@@ -206,9 +207,9 @@ class TestWorkerAgentLifecycleProperties:
         mock_worker_host._release_from_worker.side_effect = mock_release_from_worker
 
         with (
-            patch.object(worker1, "_stage_s3_bucket", return_value=None),
+            patch.object(worker1, "_transfer_files", return_value=None),
             patch.object(worker1, "get_worker_id", return_value="worker-test123"),
-            patch.object(worker2, "_stage_s3_bucket", return_value=None),
+            patch.object(worker2, "_transfer_files", return_value=None),
             patch.object(worker2, "get_worker_id", return_value="worker-test456"),
         ):
 
@@ -250,7 +251,7 @@ class TestWorkerAgentLifecycleProperties:
         **Validates: Requirements 2.4**
         """
         with (
-            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "_transfer_files", return_value=None),
             patch.object(worker, "get_worker_id", return_value="worker-test123"),
         ):
 
@@ -318,9 +319,9 @@ class TestSequentialWorkerAgentConfiguration:
             )
 
         with (
-            patch.object(worker_a, "_stage_s3_bucket", return_value=None),
+            patch.object(worker_a, "_transfer_files", return_value=None),
             patch.object(worker_a, "get_worker_id", return_value="worker-aaa123"),
-            patch.object(worker_b, "_stage_s3_bucket", return_value=None),
+            patch.object(worker_b, "_transfer_files", return_value=None),
             patch.object(worker_b, "get_worker_id", return_value="worker-bbb456"),
         ):
 
@@ -420,9 +421,9 @@ class TestSequentialWorkerAgentConfiguration:
             )
 
         with (
-            patch.object(worker_a, "_stage_s3_bucket", return_value=None),
+            patch.object(worker_a, "_transfer_files", return_value=None),
             patch.object(worker_a, "get_worker_id", return_value="worker-aaa123"),
-            patch.object(worker_b, "_stage_s3_bucket", return_value=None),
+            patch.object(worker_b, "_transfer_files", return_value=None),
             patch.object(worker_b, "get_worker_id", return_value="worker-bbb456"),
         ):
 
@@ -470,7 +471,7 @@ class TestWorkerAgentConfigurationCorrectness:
             )
 
         with (
-            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "_transfer_files", return_value=None),
             patch.object(worker, "get_worker_id", return_value="worker-test123"),
         ):
 
@@ -561,7 +562,7 @@ class TestWorkerAgentConfigurationCorrectness:
             )
 
         with (
-            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "_transfer_files", return_value=None),
             patch.object(worker, "get_worker_id", return_value="worker-test123"),
         ):
 
@@ -617,7 +618,7 @@ class TestWorkerAgentConfigurationCorrectness:
             )
 
         with (
-            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "_transfer_files", return_value=None),
             patch.object(worker, "get_worker_id", return_value="worker-test123"),
         ):
 
@@ -672,7 +673,7 @@ class TestWorkerAgentConfigurationCorrectness:
             )
 
         with (
-            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "_transfer_files", return_value=None),
             patch.object(worker, "get_worker_id", return_value="worker-test123"),
         ):
 
@@ -752,7 +753,7 @@ class TestOSAgnosticWorkerAgentOperations:
 
         # Test 1: Worker agent lifecycle operations should work regardless of OS
         with (
-            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "_transfer_files", return_value=None),
             patch.object(worker, "get_worker_id", return_value="worker-test123"),
         ):
 
@@ -789,7 +790,7 @@ class TestOSAgnosticWorkerAgentOperations:
 
         # Test 3: Worker ID retrieval should work regardless of OS
         with (
-            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "_transfer_files", return_value=None),
             patch.object(worker, "get_worker_id", return_value="worker-abc123"),
         ):
 
@@ -861,3 +862,205 @@ class TestOSAgnosticWorkerAgentOperations:
                     worker_host=mock_host,
                     deadline_client=MagicMock(),
                 )
+
+
+class TestWorkerAgentStateCleanupProperties:
+    """Property tests for worker agent state cleanup including file mappings."""
+
+    @pytest.mark.parametrize(
+        "file_mappings,expected_cleanup_files",
+        [
+            # Test case 1: Single file mapping
+            (
+                [("/tmp/source1.txt", "/home/test-user/dest1.txt")],
+                ["/home/test-user/dest1.txt"],
+            ),
+            # Test case 2: Multiple file mappings
+            (
+                [
+                    ("/tmp/source1.txt", "/home/test-user/dest1.txt"),
+                    ("/tmp/source2.json", "/etc/config/dest2.json"),
+                    ("/tmp/source3.sh", "/usr/local/bin/dest3.sh"),
+                ],
+                [
+                    "/home/test-user/dest1.txt",
+                    "/etc/config/dest2.json",
+                    "/usr/local/bin/dest3.sh",
+                ],
+            ),
+            # Test case 3: No file mappings
+            (None, []),
+            # Test case 4: Empty file mappings list
+            ([], []),
+            # Test case 5: File mappings with special characters in paths
+            (
+                [
+                    ("/tmp/file with spaces.txt", "/home/test-user/file with spaces.txt"),
+                    ("/tmp/file-with-dashes.txt", "/home/test-user/file-with-dashes.txt"),
+                ],
+                [
+                    "/home/test-user/file with spaces.txt",
+                    "/home/test-user/file-with-dashes.txt",
+                ],
+            ),
+            # Test case 6: File mappings with nested directories
+            (
+                [
+                    ("/tmp/src/nested/file.txt", "/home/test-user/dest/nested/file.txt"),
+                    ("/tmp/another.txt", "/var/lib/another.txt"),
+                ],
+                [
+                    "/home/test-user/dest/nested/file.txt",
+                    "/var/lib/another.txt",
+                ],
+            ),
+        ],
+    )
+    def test_property_9_worker_agent_state_cleanup(
+        self, worker_config, mock_worker_host, file_mappings, expected_cleanup_files
+    ):
+        """
+        Property 9: Worker agent state cleanup
+
+        For any worker host with a running worker agent, stopping the worker agent
+        should remove all worker agent state files (worker.json, configuration files, etc.)
+        and clean up all staged files from file_mappings.
+
+        **Validates: Requirements 6.2**
+        """
+        # Given: A worker configuration with file mappings
+        config_with_files = DeadlineWorkerConfiguration(
+            farm_id=worker_config.farm_id,
+            fleet=worker_config.fleet,
+            region=worker_config.region,
+            job_user=worker_config.job_user,
+            job_user_group=worker_config.job_user_group,
+            allow_shutdown=worker_config.allow_shutdown,
+            worker_agent_install=worker_config.worker_agent_install,
+            file_mappings=file_mappings,
+        )
+
+        with patch("boto3.client"):
+            worker = PosixInstanceBuildWorker(
+                configuration=config_with_files,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+        # Given: A running worker agent
+        mock_worker_host.is_running.return_value = True
+
+        with (
+            patch.object(worker, "_transfer_files", return_value=None),
+            patch.object(worker, "get_worker_id", return_value="worker-test123"),
+        ):
+            worker.start()
+
+        # When: Stopping the worker agent
+        with (
+            patch.object(worker, "_stop_agent_service"),
+            patch.object(worker, "_cleanup_agent_state"),
+            patch.object(worker, "_delete_worker"),
+        ):
+            worker.stop()
+
+        # Then: All staged files should be cleaned up via worker_host.cleanup_files()
+        if expected_cleanup_files:
+            # Verify that cleanup_files was called on the worker_host
+            mock_worker_host.cleanup_files.assert_called_once()
+
+            # Get the file_paths argument that was passed to cleanup_files
+            call_args = mock_worker_host.cleanup_files.call_args
+            actual_file_paths = call_args[0][0] if call_args else []
+
+            # Verify all expected files were passed to cleanup_files
+            assert len(actual_file_paths) == len(expected_cleanup_files), (
+                f"Expected {len(expected_cleanup_files)} files to be cleaned up, "
+                f"but got {len(actual_file_paths)}: {actual_file_paths}"
+            )
+            for expected_file in expected_cleanup_files:
+                assert (
+                    expected_file in actual_file_paths
+                ), f"Expected file {expected_file} not found in cleanup_files call: {actual_file_paths}"
+        else:
+            # If no file mappings, cleanup_files should not be called
+            mock_worker_host.cleanup_files.assert_not_called()
+
+        # Verify worker state is cleaned up
+        assert worker.agent_state == WorkerAgentState.NOT_STARTED
+        assert worker.worker_id is None
+
+    @pytest.mark.parametrize(
+        "os_type,file_paths,expected_command_pattern",
+        [
+            # POSIX file cleanup - single file (no special chars, no quotes needed)
+            ("posix", ["/home/test-user/file.txt"], "rm -f /home/test-user/file.txt"),
+            # POSIX file cleanup - multiple files
+            (
+                "posix",
+                ["/etc/config/settings.json", "/var/log/app.log"],
+                "rm -f /etc/config/settings.json /var/log/app.log",
+            ),
+            # Windows file cleanup - single file
+            (
+                "windows",
+                ["C:\\Users\\test-user\\file.txt"],
+                '@("C:\\Users\\test-user\\file.txt") | ForEach-Object { Remove-Item -Path $_ -Force -ErrorAction SilentlyContinue }',
+            ),
+            # Windows file cleanup - multiple files
+            (
+                "windows",
+                ["C:\\ProgramData\\config\\settings.json", "C:\\Temp\\data.txt"],
+                '@("C:\\ProgramData\\config\\settings.json", "C:\\Temp\\data.txt") | ForEach-Object { Remove-Item -Path $_ -Force -ErrorAction SilentlyContinue }',
+            ),
+        ],
+    )
+    def test_property_9_os_specific_file_cleanup_commands(
+        self, os_type, file_paths, expected_command_pattern
+    ):
+        """
+        Property 9 extended: OS-specific file cleanup commands
+
+        File cleanup should use the appropriate OS-specific command in a single batch
+        (rm -f for POSIX, Remove-Item with ForEach-Object for Windows).
+
+        **Validates: Requirements 6.2**
+        """
+        # Import the appropriate host class based on OS type
+        if os_type == "posix":
+            from deadline_test_fixtures.deadline.worker_host import PosixEC2WorkerHost
+
+            HostClass: Any = PosixEC2WorkerHost
+        else:
+            from deadline_test_fixtures.deadline.worker_host import WindowsEC2WorkerHost
+
+            HostClass = WindowsEC2WorkerHost
+
+        # Create a real host instance (not mocked) to test the actual command generation
+        # We only need to provide the minimal required parameters for initialization
+        with patch("boto3.client"):
+            host = HostClass(
+                subnet_id="subnet-12345",
+                security_group_id="sg-12345",
+                instance_profile_name="test-profile",
+                bootstrap_bucket_name="test-bucket",
+                s3_client=MagicMock(),
+                ec2_client=MagicMock(),
+                ssm_client=MagicMock(),
+                instance_type="t3.micro",
+                instance_shutdown_behavior="terminate",
+            )
+
+        # Test the _get_remove_files_command method directly
+        actual_command = host._get_remove_files_command(file_paths)
+
+        # Verify the command matches the expected pattern
+        assert actual_command == expected_command_pattern, (
+            f"Expected command:\n{expected_command_pattern}\n\n" f"But got:\n{actual_command}"
+        )
+
+        # Verify all file paths are in the command
+        for file_path in file_paths:
+            assert (
+                file_path in actual_command
+            ), f"Expected file path '{file_path}' in cleanup command: {actual_command}"

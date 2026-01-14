@@ -378,6 +378,31 @@ fi
 """
 
     def ebs_devices(self) -> dict[str, int] | None:
+        return None
+
+    def _get_download_files_command(self, s3_files: list[tuple[str, str]]) -> str:
+        """Get the OS-specific command to download files from S3."""
+        if self._os == "windows":
+            download_commands = [f"aws s3 cp {s3_uri} {dst}" for s3_uri, dst in s3_files]
+            return " ; ".join(download_commands)
+        else:
+            import shlex
+
+            download_commands = [
+                f"aws s3 cp {shlex.quote(s3_uri)} {shlex.quote(dst)} && chmod o+rx {shlex.quote(dst)}"
+                for s3_uri, dst in s3_files
+            ]
+            return " && ".join(download_commands)
+
+    def _get_remove_files_command(self, file_paths: list[str]) -> str:
+        """Get the OS-specific command to remove multiple files in a single command."""
+        if self._os == "windows":
+            paths_array = ", ".join([f'"{path}"' for path in file_paths])
+            return f"@({paths_array}) | ForEach-Object {{ Remove-Item -Path $_ -Force -ErrorAction SilentlyContinue }}"
+        else:
+            import shlex
+
+            return f"rm -f {shlex.join(file_paths)}"
         return {"/dev/xvda": 30} if self._os == "posix" else {"/dev/sda1": 60}
 
 

@@ -21,7 +21,6 @@ from deadline_test_fixtures import (
     Fleet,
     PipInstall,
     PosixInstanceBuildWorker,
-    S3Object,
 )
 from deadline_test_fixtures.deadline.worker_host import PosixEC2WorkerHost
 from deadline_test_fixtures.deadline import worker as mod
@@ -187,13 +186,9 @@ class TestPosixInstanceBuildWorker:
     @patch.object(mod, "open", mock_open(read_data="mock data".encode()))
     def test_start(self, worker: PosixInstanceBuildWorker) -> None:
         # GIVEN
-        s3_files = [
-            ("s3://bucket/key", "/tmp/key"),
-            ("s3://bucket/tmp/file", "/tmp/file"),
-        ]
         with (
             patch.object(worker.worker_host, "is_running", return_value=True),
-            patch.object(worker, "_stage_s3_bucket", return_value=s3_files) as mock_stage_s3_bucket,
+            patch.object(worker, "_transfer_files") as mock_transfer_files,
             patch.object(worker, "_install_agent") as mock_install_agent,
             patch.object(worker, "_configure_agent") as mock_configure_agent,
             patch.object(worker, "_start_agent_service") as mock_start_agent_service,
@@ -208,8 +203,8 @@ class TestPosixInstanceBuildWorker:
 
         # THEN
         # Detailed testing for each of these is done in dedicated test methods
-        mock_stage_s3_bucket.assert_called_once()
-        mock_install_agent.assert_called_once_with(s3_files)
+        mock_transfer_files.assert_called_once()
+        mock_install_agent.assert_called_once()
         mock_configure_agent.assert_called_once()
         mock_start_agent_service.assert_called_once()
         mock_get_worker_id.assert_called_once()
@@ -218,14 +213,9 @@ class TestPosixInstanceBuildWorker:
     @patch.object(mod, "open", mock_open(read_data="mock data".encode()))
     def test_start_userdata_successful(self, worker: PosixInstanceBuildWorker) -> None:
         # GIVEN
-        s3_files = [
-            ("s3://bucket/key", "/tmp/key"),
-            ("s3://bucket/tmp/file", "/tmp/file"),
-        ]
-
         with (
             patch.object(worker.worker_host, "is_running", return_value=True),
-            patch.object(worker, "_stage_s3_bucket", return_value=s3_files),
+            patch.object(worker, "_transfer_files"),
             patch.object(worker, "_install_agent") as mock_install_agent,
             patch.object(worker, "_configure_agent") as mock_configure_agent,
             patch.object(worker, "_start_agent_service") as mock_start_agent_service,
@@ -248,14 +238,9 @@ class TestPosixInstanceBuildWorker:
     def test_start_userdata_unsuccessful(self, worker: PosixInstanceBuildWorker) -> None:
         # GIVEN - This test is no longer relevant since userdata is handled by WorkerHost
         # We'll test agent configuration failure instead
-        s3_files = [
-            ("s3://bucket/key", "/tmp/key"),
-            ("s3://bucket/tmp/file", "/tmp/file"),
-        ]
-
         with (
             patch.object(worker.worker_host, "is_running", return_value=True),
-            patch.object(worker, "_stage_s3_bucket", return_value=s3_files),
+            patch.object(worker, "_transfer_files"),
             patch.object(worker, "_install_agent"),
             patch.object(
                 worker, "_configure_agent", side_effect=AssertionError("Agent config failed")
@@ -272,14 +257,9 @@ class TestPosixInstanceBuildWorker:
     def test_start_userdata_timed_out(self, worker: PosixInstanceBuildWorker) -> None:
         # GIVEN - This test is no longer relevant since userdata is handled by WorkerHost
         # We'll test agent startup timeout instead
-        s3_files = [
-            ("s3://bucket/key", "/tmp/key"),
-            ("s3://bucket/tmp/file", "/tmp/file"),
-        ]
-
         with (
             patch.object(worker.worker_host, "is_running", return_value=True),
-            patch.object(worker, "_stage_s3_bucket", return_value=s3_files),
+            patch.object(worker, "_transfer_files"),
             patch.object(worker, "_install_agent"),
             patch.object(worker, "_configure_agent"),
             patch.object(
@@ -290,40 +270,31 @@ class TestPosixInstanceBuildWorker:
             # WHEN / #THEN
             worker.start()
 
-    def test_stage_s3_bucket(
+    def test_transfer_files(
         self,
         worker: PosixInstanceBuildWorker,
         worker_config: DeadlineWorkerConfiguration,
         bootstrap_bucket_name: str,
     ) -> None:
         # GIVEN
-        # We don't want to actually match real files, just limit src paths to absolute paths
-        with (
-            patch.object(mod.glob, "glob", lambda path: [path]),
-            patch.object(mod, "open", mock_open(read_data="mock data".encode())),
-        ):
+        # Mock the worker_host.transfer_files to verify it's called correctly
+        with patch.object(worker.worker_host, "transfer_files") as mock_transfer_files:
             # WHEN
-            s3_files = worker._stage_s3_bucket()
+            worker._transfer_files()
 
-        # THEN
-        # Verify mappings are correct
-        assert s3_files is not None and worker_config.file_mappings is not None
-        assert len(s3_files) == len(worker_config.file_mappings)
-        for src, dst in worker_config.file_mappings:
-            assert (f"s3://{bootstrap_bucket_name}/worker/{os.path.basename(src)}", dst) in s3_files
-
-        # Verify files are uploaded to S3
-        s3_client = boto3.client("s3")
-        for s3_uri, _ in s3_files:
-            s3_obj = S3Object.from_uri(s3_uri)
-            s3_client.head_object(Bucket=s3_obj.bucket, Key=s3_obj.key)
+            # THEN
+            # Verify that worker_host.transfer_files was called with correct arguments
+            if worker_config.file_mappings:
+                mock_transfer_files.assert_called_once_with(worker_config.file_mappings)
+            else:
+                mock_transfer_files.assert_not_called()
 
     def test_stop(self, worker: PosixInstanceBuildWorker) -> None:
         # GIVEN
         # Start the worker first
         with (
             patch.object(worker.worker_host, "is_running", return_value=True),
-            patch.object(worker, "_stage_s3_bucket", return_value=None),
+            patch.object(worker, "_transfer_files", return_value=None),
             patch.object(
                 worker, "get_worker_id", return_value="worker-7c3377ec9eba444bb51cc7da18463081"
             ),

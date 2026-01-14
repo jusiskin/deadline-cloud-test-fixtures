@@ -113,7 +113,7 @@
 
 ## Phase 3: Update File Mappings and Error Handling
 
-- [ ] 9. Move file mappings to worker agent lifecycle and add property test
+- [x] 9. Move file mappings to worker agent lifecycle and add property test
   - Move file staging from `_launch_instance()` to worker agent `start()` method
   - Implement file cleanup in worker agent `stop()` method
   - Update file transfer to happen after host is running but before agent configuration
