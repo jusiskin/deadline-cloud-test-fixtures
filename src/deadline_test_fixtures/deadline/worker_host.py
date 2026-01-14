@@ -95,9 +95,17 @@ class WorkerHost(abc.ABC):
     def start(self) -> None:
         """Start the worker host."""
         if self._state == WorkerHostState.RUNNING:
-            raise RuntimeError("Worker host is already running")
+            raise WorkerHostError(
+                message="Worker host is already running",
+                host_os=self._operating_system(),
+                diagnostics="Cannot start a host that is already in RUNNING state",
+            )
         if self._state == WorkerHostState.STOPPED:
-            raise RuntimeError("Cannot restart a stopped worker host")
+            raise WorkerHostError(
+                message="Cannot restart a stopped worker host",
+                host_os=self._operating_system(),
+                diagnostics="Worker hosts cannot be restarted after being stopped. Create a new host instead.",
+            )
 
         self._do_start()
         self._state = WorkerHostState.RUNNING
@@ -115,7 +123,11 @@ class WorkerHost(abc.ABC):
         - From NOT_STARTED: Cleans up any partial resources from a failed start attempt
         """
         if self._state == WorkerHostState.STOPPED:
-            raise RuntimeError("Worker host is already stopped")
+            raise WorkerHostError(
+                message="Worker host is already stopped",
+                host_os=self._operating_system(),
+                diagnostics="Cannot stop a host that is already in STOPPED state",
+            )
 
         # Always call _do_stop() to clean up resources, even if start() failed partway
         self._do_stop()
@@ -140,13 +152,14 @@ class WorkerHost(abc.ABC):
         Claim this host for a worker agent.
 
         Raises:
-            RuntimeError: If another worker already has an agent on this host
+            WorkerHostError: If another worker already has an agent on this host
         """
         if self._active_worker_id is not None and self._active_worker_id != worker_id:
-            raise RuntimeError(
-                f"Cannot start worker agent: another worker (id={self._active_worker_id}) "
-                f"already has an agent running on this host. "
-                f"Call stop() on that worker first."
+            raise WorkerHostError(
+                message="Cannot start worker agent: another worker already has an agent running on this host",
+                host_os=self._operating_system(),
+                instance_id=getattr(self, "instance_id", None),
+                diagnostics=f"Active worker ID: {self._active_worker_id}. Call stop() on that worker first.",
             )
         self._active_worker_id = worker_id
 
@@ -185,6 +198,56 @@ class InstanceStartupError(Exception):
             error_msg.append("No diagnostics available")
 
         error_msg.append("=" * 80)  # Separator line
+
+        super().__init__("\n".join(error_msg))
+
+
+class WorkerHostError(Exception):
+    """
+    Exception raised when worker host operations fail.
+
+    This exception includes diagnostic information about the worker host state
+    to help identify the source of the failure.
+
+    Attributes:
+        message: Human-readable error message
+        host_os: Operating system of the worker host (e.g., 'windows', 'posix')
+        instance_id: EC2 instance ID (if available)
+        diagnostics: Additional diagnostic information about the host state
+    """
+
+    def __init__(
+        self,
+        message: str,
+        host_os: Optional[str] = None,
+        instance_id: Optional[str] = None,
+        diagnostics: Optional[str] = None,
+    ):
+        self.message = message
+        self.host_os = host_os
+        self.instance_id = instance_id
+        self.diagnostics = diagnostics
+
+        # Format error message with clear indication this is a host-level error
+        error_msg = [
+            "WORKER HOST ERROR",
+            "=" * 80,
+            f"{message}",
+            "=" * 80,
+            "HOST DIAGNOSTICS",
+            "=" * 80,
+        ]
+
+        if host_os:
+            error_msg.append(f"Operating System: {host_os}")
+        if instance_id:
+            error_msg.append(f"Instance ID: {instance_id}")
+        if diagnostics:
+            error_msg.append(f"\n{diagnostics}")
+        else:
+            error_msg.append("No additional diagnostics available")
+
+        error_msg.append("=" * 80)
 
         super().__init__("\n".join(error_msg))
 
@@ -279,7 +342,11 @@ class EC2WorkerHost(WorkerHost):
     def _wait_until_userdata_finishes(self) -> None:
         """Wait for userdata to complete successfully."""
         if not self.instance_id:
-            raise RuntimeError("Cannot wait for userdata: no instance ID available")
+            raise WorkerHostError(
+                message="Cannot wait for userdata: no instance ID available",
+                host_os=self._operating_system(),
+                diagnostics="Instance ID is None. The instance may not have been launched successfully.",
+            )
 
         result: Optional[CommandResult] = None
         success: bool = False
@@ -310,16 +377,20 @@ class EC2WorkerHost(WorkerHost):
                 max_retries=60,
             )
         except TimeoutError as e:
-            raise InstanceStartupError(
+            raise WorkerHostError(
                 message=f"Timeout waiting for userdata to complete on instance {self.instance_id}",
+                host_os=self._operating_system(),
+                instance_id=self.instance_id,
                 diagnostics="Userdata did not complete within 300 seconds (60 retries × 5s intervals)",
             ) from e
 
         if not success:
             # Userdata failed - include the failure details in the error
             failure_details = str(result) if result else "No result available"
-            raise InstanceStartupError(
+            raise WorkerHostError(
                 message=f"Userdata failed on instance {self.instance_id}",
+                host_os=self._operating_system(),
+                instance_id=self.instance_id,
                 diagnostics=f"Userdata failure details:\n{failure_details}",
             )
 
@@ -334,7 +405,11 @@ class EC2WorkerHost(WorkerHost):
     ) -> CommandResult:
         """Send a command via SSM without checking if host is running (for internal use during startup)."""
         if not self.instance_id:
-            raise RuntimeError("No instance ID available")
+            raise WorkerHostError(
+                message="No instance ID available",
+                host_os=self._operating_system(),
+                diagnostics="Cannot send command without an instance ID. The instance may not have been launched.",
+            )
 
         ssm_waiter = self.ssm_client.get_waiter("command_executed")
 
@@ -409,10 +484,19 @@ class EC2WorkerHost(WorkerHost):
     ) -> CommandResult:
         """Send a command via SSM to a shell on a launched EC2 instance."""
         if not self.is_running():
-            raise RuntimeError("Cannot send command to non-running host")
+            raise WorkerHostError(
+                message="Cannot send command to non-running host",
+                host_os=self._operating_system(),
+                instance_id=getattr(self, "instance_id", None),
+                diagnostics=f"Host state is {self._state}. Host must be in RUNNING state to send commands.",
+            )
 
         if not self.instance_id:
-            raise RuntimeError("No instance ID available")
+            raise WorkerHostError(
+                message="No instance ID available",
+                host_os=self._operating_system(),
+                diagnostics="Cannot send command without an instance ID.",
+            )
 
         ssm_waiter = self.ssm_client.get_waiter("command_executed")
 

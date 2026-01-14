@@ -9,11 +9,11 @@ from deadline_test_fixtures.deadline.worker_host import (
     CommandResult,
     Ec2Tag,
     EC2WorkerHost,
-    InstanceStartupError,
     PosixEC2WorkerHost,
     WindowsEC2WorkerHost,
     WorkerAgentState,
     WorkerHost,
+    WorkerHostError,
     WorkerHostState,
 )
 
@@ -84,26 +84,26 @@ class TestWorkerHost:
         assert host._stopped
 
     def test_start_when_already_running_raises_error(self):
-        """Test that start() raises RuntimeError when already running."""
+        """Test that start() raises WorkerHostError when already running."""
         host = MockWorkerHost()
         host.start()
-        with pytest.raises(RuntimeError, match="Worker host is already running"):
+        with pytest.raises(WorkerHostError, match="Worker host is already running"):
             host.start()
 
     def test_start_when_stopped_raises_error(self):
-        """Test that start() raises RuntimeError when already stopped."""
+        """Test that start() raises WorkerHostError when already stopped."""
         host = MockWorkerHost()
         host.start()
         host.stop()
-        with pytest.raises(RuntimeError, match="Cannot restart a stopped worker host"):
+        with pytest.raises(WorkerHostError, match="Cannot restart a stopped worker host"):
             host.start()
 
     def test_stop_when_already_stopped_raises_error(self):
-        """Test that stop() raises RuntimeError when already stopped."""
+        """Test that stop() raises WorkerHostError when already stopped."""
         host = MockWorkerHost()
         host.start()
         host.stop()
-        with pytest.raises(RuntimeError, match="Worker host is already stopped"):
+        with pytest.raises(WorkerHostError, match="Worker host is already stopped"):
             host.stop()
 
     def test_worker_claiming_and_releasing(self):
@@ -124,7 +124,7 @@ class TestWorkerHost:
         assert host.has_active_worker
 
         # Different worker cannot claim
-        with pytest.raises(RuntimeError, match="another worker.*already has an agent running"):
+        with pytest.raises(WorkerHostError, match="another worker.*already has an agent running"):
             host._claim_for_worker(worker_id_2)
 
         # Release from worker 1
@@ -227,7 +227,7 @@ class TestWorkerHostStateManagement:
 
         # Perform action and check result
         if should_raise:
-            with pytest.raises(RuntimeError):
+            with pytest.raises(WorkerHostError):
                 if action == "start":
                     host.start()
                 else:
@@ -262,7 +262,7 @@ class TestWorkerHostStateManagement:
                 assert host.has_active_worker
             elif action == "claim_fail":
                 with pytest.raises(
-                    RuntimeError, match="another worker.*already has an agent running"
+                    WorkerHostError, match="another worker.*already has an agent running"
                 ):
                     host._claim_for_worker(worker_id)
             elif action == "release":
@@ -837,8 +837,8 @@ class TestEC2WorkerHostPropertyTests:
             "StandardErrorContent": "",
         }
 
-        # Starting should raise InstanceStartupError when userdata fails
-        with pytest.raises(InstanceStartupError) as exc_info:
+        # Starting should raise WorkerHostError when userdata fails
+        with pytest.raises(WorkerHostError) as exc_info:
             host_fail.start()
 
         # Verify the error includes diagnostic information
@@ -866,9 +866,9 @@ class TestEC2WorkerHostPropertyTests:
             "StandardErrorContent": "",
         }
 
-        # Starting should raise InstanceStartupError on timeout
+        # Starting should raise WorkerHostError on timeout
         # (time.sleep is mocked by autouse fixture, so this will complete quickly)
-        with pytest.raises(InstanceStartupError) as exc_info:
+        with pytest.raises(WorkerHostError) as exc_info:
             host_timeout.start()
 
         # Verify the error indicates timeout

@@ -91,6 +91,117 @@ class InstanceStartupError(Exception):
         super().__init__("\n".join(error_msg))
 
 
+class WorkerHostError(Exception):
+    """
+    Exception raised when worker host operations fail.
+
+    This exception includes diagnostic information about the worker host state
+    to help identify the source of the failure.
+
+    Attributes:
+        message: Human-readable error message
+        host_os: Operating system of the worker host (e.g., 'windows', 'posix')
+        instance_id: EC2 instance ID (if available)
+        diagnostics: Additional diagnostic information about the host state
+    """
+
+    def __init__(
+        self,
+        message: str,
+        host_os: Optional[str] = None,
+        instance_id: Optional[str] = None,
+        diagnostics: Optional[str] = None,
+    ):
+        self.message = message
+        self.host_os = host_os
+        self.instance_id = instance_id
+        self.diagnostics = diagnostics
+
+        # Format error message with clear indication this is a host-level error
+        error_msg = [
+            "WORKER HOST ERROR",
+            "=" * 80,
+            f"{message}",
+            "=" * 80,
+            "HOST DIAGNOSTICS",
+            "=" * 80,
+        ]
+
+        if host_os:
+            error_msg.append(f"Operating System: {host_os}")
+        if instance_id:
+            error_msg.append(f"Instance ID: {instance_id}")
+        if diagnostics:
+            error_msg.append(f"\n{diagnostics}")
+        else:
+            error_msg.append("No additional diagnostics available")
+
+        error_msg.append("=" * 80)
+
+        super().__init__("\n".join(error_msg))
+
+
+class WorkerAgentError(Exception):
+    """
+    Exception raised when worker agent operations fail.
+
+    This exception includes diagnostic information about the worker agent state
+    and relevant log output to help identify the source of the failure.
+
+    Attributes:
+        message: Human-readable error message
+        configuration: Worker agent configuration (if available)
+        command_result: Result of the failed command (if applicable)
+        logs: Relevant log output from the worker agent
+        worker_id: Worker ID (if available)
+    """
+
+    def __init__(
+        self,
+        message: str,
+        configuration: Optional[DeadlineWorkerConfiguration] = None,
+        command_result: Optional[CommandResult] = None,
+        logs: Optional[str] = None,
+        worker_id: Optional[str] = None,
+    ):
+        self.message = message
+        self.configuration = configuration
+        self.command_result = command_result
+        self.logs = logs
+        self.worker_id = worker_id
+
+        # Format error message with clear indication this is an agent-level error
+        error_msg = [
+            "WORKER AGENT ERROR",
+            "=" * 80,
+            f"{message}",
+            "=" * 80,
+            "AGENT DIAGNOSTICS",
+            "=" * 80,
+        ]
+
+        if worker_id:
+            error_msg.append(f"Worker ID: {worker_id}")
+        if configuration:
+            error_msg.append(f"Farm ID: {configuration.farm_id}")
+            error_msg.append(f"Fleet ID: {configuration.fleet.id}")
+            error_msg.append(f"Region: {configuration.region}")
+        if command_result:
+            error_msg.append(f"\nCommand Exit Code: {command_result.exit_code}")
+            if command_result.stdout:
+                error_msg.append(f"Command Output:\n{command_result.stdout}")
+            if command_result.stderr:
+                error_msg.append(f"Command Error:\n{command_result.stderr}")
+        if logs:
+            error_msg.append(f"\nAgent Logs:\n{logs}")
+        else:
+            error_msg.append("No additional diagnostics available")
+
+        error_msg.append("=" * 80)
+
+        super().__init__("\n".join(error_msg))
+
+
 @dataclass(frozen=True)
 class DeadlineWorkerConfiguration:
     farm_id: str
@@ -319,15 +430,18 @@ class EC2InstanceWorker(DeadlineWorker):
             RuntimeError: If another worker already has an agent on this host
         """
         if not self.worker_host.is_running():
-            raise RuntimeError(
-                "Cannot start worker agent: worker host is not running. "
-                "Call worker_host.start() first."
+            raise WorkerAgentError(
+                message="Cannot start worker agent: worker host is not running",
+                configuration=self.configuration,
+                logs="Call worker_host.start() first to start the host before starting the agent.",
             )
 
         if self._agent_state == WorkerAgentState.RUNNING:
-            raise RuntimeError(
-                "Cannot start worker agent: this worker already has an agent running. "
-                "Call stop() first to remove the existing agent."
+            raise WorkerAgentError(
+                message="Cannot start worker agent: this worker already has an agent running",
+                worker_id=self.worker_id,
+                configuration=self.configuration,
+                logs="Call stop() first to remove the existing agent before starting a new one.",
             )
 
         # Claim the host for this worker (raises if another worker is using it)
@@ -512,7 +626,12 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
             f"{self.configure_worker_command(config=self.configuration)}",
             {"Delay": 5, "MaxAttempts": 48},
         )
-        assert cmd_result.exit_code == 0, f"Failed to configure Worker agent: {cmd_result}"
+        if cmd_result.exit_code != 0:
+            raise WorkerAgentError(
+                message="Failed to configure Worker agent. Worker agent configuration command failed. Check command output for details.",
+                configuration=self.configuration,
+                command_result=cmd_result,
+            )
         LOG.info("Successfully configured Worker agent")
 
     def _start_agent_service(self) -> None:
@@ -564,7 +683,12 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
             ),
         )
 
-        assert cmd_result.exit_code == 0, f"Failed to start Worker Agent service: : {cmd_result}"
+        if cmd_result.exit_code != 0:
+            raise WorkerAgentError(
+                message="Failed to start Worker Agent service. Worker agent service failed to start. Check command output and agent logs.",
+                configuration=self.configuration,
+                command_result=cmd_result,
+            )
 
         self.worker_id = self.get_worker_id()
 
@@ -573,7 +697,13 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
         LOG.info("Sending command to stop the Worker Agent service")
         cmd_result = self.send_command('Stop-Service -Name "DeadlineWorker"')
 
-        assert cmd_result.exit_code == 0, f"Failed to stop Worker Agent service: : {cmd_result}"
+        if cmd_result.exit_code != 0:
+            raise WorkerAgentError(
+                message="Failed to stop Worker Agent service. Worker agent service failed to stop. Check command output for details.",
+                configuration=self.configuration,
+                worker_id=self.worker_id,
+                command_result=cmd_result,
+            )
 
     def get_worker_id(self) -> str:
         """Retrieve the worker ID from the worker agent."""
@@ -588,7 +718,12 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
             ),
             {"Delay": 5, "MaxAttempts": 36},
         )
-        assert cmd_result.exit_code == 0, f"Failed to get Worker ID: {cmd_result}"
+        if cmd_result.exit_code != 0:
+            raise WorkerAgentError(
+                message="Failed to get Worker ID. Could not retrieve worker ID from worker.json file. The worker agent may not have started correctly.",
+                configuration=self.configuration,
+                command_result=cmd_result,
+            )
 
         worker_id = cmd_result.stdout.rstrip("\n\r")
         assert re.match(
@@ -754,7 +889,12 @@ class PosixInstanceWorkerBase(EC2InstanceWorker):
         LOG.info(f"Sending SSM command to configure Worker agent on instance {self.instance_id}")
 
         cmd_result = self.send_command(self.configure_worker_command(config=self.configuration))
-        assert cmd_result.exit_code == 0, f"Failed to configure Worker agent: {cmd_result}"
+        if cmd_result.exit_code != 0:
+            raise WorkerAgentError(
+                message="Failed to configure Worker agent. Worker agent configuration command failed. Check command output for details.",
+                configuration=self.configuration,
+                command_result=cmd_result,
+            )
         LOG.info("Successfully configured Worker agent")
 
     def _start_agent_service(self) -> None:
@@ -806,7 +946,12 @@ class PosixInstanceWorkerBase(EC2InstanceWorker):
             )
         )
 
-        assert cmd_result.exit_code == 0, f"Failed to start Worker Agent service: {cmd_result}"
+        if cmd_result.exit_code != 0:
+            raise WorkerAgentError(
+                message="Failed to start Worker Agent service. Worker agent service failed to start. Check command output and agent logs.",
+                configuration=self.configuration,
+                command_result=cmd_result,
+            )
 
         self.worker_id = self.get_worker_id()
 
@@ -815,7 +960,13 @@ class PosixInstanceWorkerBase(EC2InstanceWorker):
         LOG.info("Sending command to stop the Worker Agent service")
         cmd_result = self.send_command("systemctl stop deadline-worker")
 
-        assert cmd_result.exit_code == 0, f"Failed to stop Worker Agent service: {cmd_result}"
+        if cmd_result.exit_code != 0:
+            raise WorkerAgentError(
+                message="Failed to stop Worker Agent service. Worker agent service failed to stop. Check command output for details.",
+                configuration=self.configuration,
+                worker_id=self.worker_id,
+                command_result=cmd_result,
+            )
 
     def get_worker_id(self) -> str:
         """Retrieve the worker ID from the worker agent."""
@@ -830,7 +981,12 @@ class PosixInstanceWorkerBase(EC2InstanceWorker):
                 ]
             )
         )
-        assert cmd_result.exit_code == 0, f"Failed to get Worker ID: {cmd_result}"
+        if cmd_result.exit_code != 0:
+            raise WorkerAgentError(
+                message="Failed to get Worker ID. Could not retrieve worker ID from worker.json file. The worker agent may not have started correctly.",
+                configuration=self.configuration,
+                command_result=cmd_result,
+            )
 
         worker_id = cmd_result.stdout.rstrip("\n\r")
         LOG.info(f"Worker ID: {worker_id}")

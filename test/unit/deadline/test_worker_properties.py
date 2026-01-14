@@ -5,7 +5,7 @@ import pytest
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from deadline_test_fixtures.deadline.worker import PosixInstanceBuildWorker
+from deadline_test_fixtures.deadline.worker import PosixInstanceBuildWorker, WorkerAgentError
 from deadline_test_fixtures.deadline.worker_host import (
     PosixEC2WorkerHost,
     WorkerAgentState,
@@ -240,7 +240,7 @@ class TestWorkerAgentLifecycleProperties:
 
         # When/Then: Starting worker should fail
         with pytest.raises(
-            RuntimeError, match="Cannot start worker agent: worker host is not running"
+            WorkerAgentError, match="Cannot start worker agent: worker host is not running"
         ):
             worker.start()
 
@@ -261,7 +261,7 @@ class TestWorkerAgentLifecycleProperties:
 
             # Try to start again - should fail
             with pytest.raises(
-                RuntimeError,
+                WorkerAgentError,
                 match="Cannot start worker agent: this worker already has an agent running",
             ):
                 worker.start()
@@ -1064,3 +1064,426 @@ class TestWorkerAgentStateCleanupProperties:
             assert (
                 file_path in actual_command
             ), f"Expected file path '{file_path}' in cleanup command: {actual_command}"
+
+
+class TestErrorDiagnosticsProperties:
+    """Property tests for error diagnostics and error source distinction."""
+
+    def test_property_11_host_error_diagnostics_inclusion(self, mock_worker_host):
+        """
+        Property 11: Error diagnostics inclusion (Host errors)
+
+        For any worker host operation that fails, the raised exception should contain
+        diagnostic information specific to the host operation (host state, instance ID,
+        operating system).
+
+        **Validates: Requirements 6.1, 6.2, 6.3, 6.4**
+        """
+        from deadline_test_fixtures.deadline.worker_host import WorkerHostError
+
+        # Test case 1: Host error with full diagnostics
+        try:
+            raise WorkerHostError(
+                message="Failed to start EC2 instance",
+                host_os="posix",
+                instance_id="i-1234567890abcdef0",
+                diagnostics="Instance failed status checks\nSystem log shows kernel panic",
+            )
+        except WorkerHostError as e:
+            # Verify error contains all diagnostic information
+            assert "Failed to start EC2 instance" in str(e)
+            assert "WORKER HOST ERROR" in str(e)
+            assert "HOST DIAGNOSTICS" in str(e)
+            assert "Operating System: posix" in str(e)
+            assert "Instance ID: i-1234567890abcdef0" in str(e)
+            assert "Instance failed status checks" in str(e)
+            assert "System log shows kernel panic" in str(e)
+
+            # Verify attributes are accessible
+            assert e.message == "Failed to start EC2 instance"
+            assert e.host_os == "posix"
+            assert e.instance_id == "i-1234567890abcdef0"
+            assert e.diagnostics is not None
+            assert "Instance failed status checks" in e.diagnostics
+
+        # Test case 2: Host error with minimal diagnostics
+        try:
+            raise WorkerHostError(
+                message="Failed to send command to host",
+                host_os="windows",
+            )
+        except WorkerHostError as e:
+            # Verify error contains available diagnostic information
+            assert "Failed to send command to host" in str(e)
+            assert "WORKER HOST ERROR" in str(e)
+            assert "Operating System: windows" in str(e)
+            assert "No additional diagnostics available" in str(e)
+
+            # Verify attributes
+            assert e.message == "Failed to send command to host"
+            assert e.host_os == "windows"
+            assert e.instance_id is None
+            assert e.diagnostics is None
+
+    def test_property_11_agent_error_diagnostics_inclusion(self, worker_config):
+        """
+        Property 11: Error diagnostics inclusion (Agent errors)
+
+        For any worker agent operation that fails, the raised exception should contain
+        diagnostic information specific to the agent operation (configuration, command
+        output, agent logs).
+
+        **Validates: Requirements 6.1, 6.2, 6.3, 6.4**
+        """
+        from deadline_test_fixtures.deadline.worker import WorkerAgentError
+        from deadline_test_fixtures.deadline.worker_host import CommandResult
+
+        # Test case 1: Agent error with command result
+        cmd_result = CommandResult(
+            exit_code=1,
+            stdout="Error: Failed to configure worker agent\nConfiguration file not found",
+            stderr="Permission denied",
+        )
+
+        try:
+            raise WorkerAgentError(
+                message="Failed to configure worker agent",
+                configuration=worker_config,
+                command_result=cmd_result,
+                worker_id="worker-abc123",
+            )
+        except WorkerAgentError as e:
+            # Verify error contains all diagnostic information
+            assert "Failed to configure worker agent" in str(e)
+            assert "WORKER AGENT ERROR" in str(e)
+            assert "AGENT DIAGNOSTICS" in str(e)
+            assert "Worker ID: worker-abc123" in str(e)
+            assert f"Farm ID: {worker_config.farm_id}" in str(e)
+            assert f"Fleet ID: {worker_config.fleet.id}" in str(e)
+            assert f"Region: {worker_config.region}" in str(e)
+            assert "Command Exit Code: 1" in str(e)
+            assert "Failed to configure worker agent" in str(e)
+            assert "Permission denied" in str(e)
+
+            # Verify attributes are accessible
+            assert e.message == "Failed to configure worker agent"
+            assert e.configuration == worker_config
+            assert e.command_result == cmd_result
+            assert e.worker_id == "worker-abc123"
+
+        # Test case 2: Agent error with logs
+        try:
+            raise WorkerAgentError(
+                message="Worker agent failed to start",
+                configuration=worker_config,
+                logs="[ERROR] Failed to connect to Deadline Cloud service\n[ERROR] Connection timeout after 30s",
+            )
+        except WorkerAgentError as e:
+            # Verify error contains log information
+            assert "Worker agent failed to start" in str(e)
+            assert "WORKER AGENT ERROR" in str(e)
+            assert "Failed to connect to Deadline Cloud service" in str(e)
+            assert "Connection timeout after 30s" in str(e)
+
+            # Verify attributes
+            assert e.message == "Worker agent failed to start"
+            assert e.configuration == worker_config
+            assert e.logs is not None
+            assert "Failed to connect to Deadline Cloud service" in e.logs
+
+        # Test case 3: Agent error with minimal diagnostics
+        try:
+            raise WorkerAgentError(
+                message="Unknown agent error",
+            )
+        except WorkerAgentError as e:
+            # Verify error contains minimal information
+            assert "Unknown agent error" in str(e)
+            assert "WORKER AGENT ERROR" in str(e)
+            assert "No additional diagnostics available" in str(e)
+
+            # Verify attributes
+            assert e.message == "Unknown agent error"
+            assert e.configuration is None
+            assert e.command_result is None
+            assert e.logs is None
+            assert e.worker_id is None
+
+    @pytest.mark.parametrize(
+        "error_type,error_params,expected_diagnostics",
+        [
+            # Host error with various diagnostic combinations
+            (
+                "host",
+                {
+                    "message": "Instance launch failed",
+                    "host_os": "posix",
+                    "instance_id": "i-abc123",
+                    "diagnostics": "AMI not found in region",
+                },
+                [
+                    "WORKER HOST ERROR",
+                    "Operating System: posix",
+                    "Instance ID: i-abc123",
+                    "AMI not found",
+                ],
+            ),
+            (
+                "host",
+                {
+                    "message": "SSM command timeout",
+                    "host_os": "windows",
+                    "diagnostics": "SSM agent not responding",
+                },
+                ["WORKER HOST ERROR", "Operating System: windows", "SSM agent not responding"],
+            ),
+            # Agent error with various diagnostic combinations
+            (
+                "agent",
+                {
+                    "message": "Agent installation failed",
+                    "worker_id": "worker-xyz789",
+                    "logs": "pip install failed\nPackage not found",
+                },
+                [
+                    "WORKER AGENT ERROR",
+                    "Worker ID: worker-xyz789",
+                    "pip install failed",
+                    "Package not found",
+                ],
+            ),
+            (
+                "agent",
+                {
+                    "message": "Agent configuration failed",
+                },
+                [
+                    "WORKER AGENT ERROR",
+                    "Agent configuration failed",
+                    "No additional diagnostics available",
+                ],
+            ),
+        ],
+    )
+    def test_property_11_various_error_diagnostics(
+        self, error_type, error_params, expected_diagnostics
+    ):
+        """
+        Property 11 extended: Error diagnostics with various error scenarios
+
+        Test that error diagnostics are included for various types of failures.
+
+        **Validates: Requirements 6.1, 6.2, 6.3, 6.4**
+        """
+        if error_type == "host":
+            from deadline_test_fixtures.deadline.worker_host import WorkerHostError
+
+            try:
+                raise WorkerHostError(**error_params)
+            except WorkerHostError as e:
+                error_str = str(e)
+                for expected in expected_diagnostics:
+                    assert (
+                        expected in error_str
+                    ), f"Expected diagnostic '{expected}' not found in error message:\n{error_str}"
+        else:  # agent
+            from deadline_test_fixtures.deadline.worker import WorkerAgentError
+
+            try:
+                raise WorkerAgentError(**error_params)
+            except WorkerAgentError as e:
+                error_str = str(e)
+                for expected in expected_diagnostics:
+                    assert (
+                        expected in error_str
+                    ), f"Expected diagnostic '{expected}' not found in error message:\n{error_str}"
+
+    def test_property_12_error_source_distinction(self, worker_config):
+        """
+        Property 12: Error source distinction
+
+        For any failure, the error message should clearly indicate whether the failure
+        originated from the worker host layer or the worker agent layer.
+
+        **Validates: Requirements 6.5**
+        """
+        from deadline_test_fixtures.deadline.worker import WorkerAgentError
+        from deadline_test_fixtures.deadline.worker_host import WorkerHostError
+
+        # Test case 1: Host error clearly indicates host-level failure
+        try:
+            raise WorkerHostError(
+                message="EC2 instance failed to start",
+                host_os="posix",
+                instance_id="i-123456",
+            )
+        except WorkerHostError as e:
+            error_str = str(e)
+            # Verify clear indication of host-level error
+            assert "WORKER HOST ERROR" in error_str
+            assert "HOST DIAGNOSTICS" in error_str
+            # Verify it doesn't contain agent-related terminology
+            assert "WORKER AGENT ERROR" not in error_str
+            assert "AGENT DIAGNOSTICS" not in error_str
+
+        # Test case 2: Agent error clearly indicates agent-level failure
+        try:
+            raise WorkerAgentError(
+                message="Worker agent failed to configure",
+                configuration=worker_config,
+                worker_id="worker-abc123",
+            )
+        except WorkerAgentError as e:
+            error_str = str(e)
+            # Verify clear indication of agent-level error
+            assert "WORKER AGENT ERROR" in error_str
+            assert "AGENT DIAGNOSTICS" in error_str
+            # Verify it doesn't contain host-related terminology
+            assert "WORKER HOST ERROR" not in error_str
+            assert "HOST DIAGNOSTICS" not in error_str
+
+        # Test case 3: Different error types are distinguishable
+        host_error_msg = None
+        agent_error_msg = None
+
+        try:
+            raise WorkerHostError(message="Host failure", host_os="windows")
+        except WorkerHostError as e:
+            host_error_msg = str(e)
+
+        try:
+            raise WorkerAgentError(message="Agent failure")
+        except WorkerAgentError as e:
+            agent_error_msg = str(e)
+
+        # Verify the error messages are clearly different
+        assert host_error_msg != agent_error_msg
+        assert "WORKER HOST ERROR" in host_error_msg
+        assert "WORKER AGENT ERROR" in agent_error_msg
+        assert "HOST DIAGNOSTICS" in host_error_msg
+        assert "AGENT DIAGNOSTICS" in agent_error_msg
+
+    @pytest.mark.parametrize(
+        "error_scenario,error_class,expected_markers",
+        [
+            # Host-level errors
+            (
+                "EC2 instance launch failure",
+                "WorkerHostError",
+                ["WORKER HOST ERROR", "HOST DIAGNOSTICS"],
+            ),
+            (
+                "SSM command execution failure",
+                "WorkerHostError",
+                ["WORKER HOST ERROR", "HOST DIAGNOSTICS"],
+            ),
+            (
+                "Instance status check failure",
+                "WorkerHostError",
+                ["WORKER HOST ERROR", "HOST DIAGNOSTICS"],
+            ),
+            # Agent-level errors
+            (
+                "Worker agent installation failure",
+                "WorkerAgentError",
+                ["WORKER AGENT ERROR", "AGENT DIAGNOSTICS"],
+            ),
+            (
+                "Worker agent configuration failure",
+                "WorkerAgentError",
+                ["WORKER AGENT ERROR", "AGENT DIAGNOSTICS"],
+            ),
+            (
+                "Worker agent service start failure",
+                "WorkerAgentError",
+                ["WORKER AGENT ERROR", "AGENT DIAGNOSTICS"],
+            ),
+        ],
+    )
+    def test_property_12_various_error_sources(self, error_scenario, error_class, expected_markers):
+        """
+        Property 12 extended: Error source distinction for various failure scenarios
+
+        Test that error source is clearly distinguished for various types of failures.
+
+        **Validates: Requirements 6.5**
+        """
+        if error_class == "WorkerHostError":
+            from deadline_test_fixtures.deadline.worker_host import WorkerHostError
+
+            try:
+                raise WorkerHostError(
+                    message=error_scenario,
+                    host_os="posix",
+                )
+            except WorkerHostError as e:
+                error_str = str(e)
+                for marker in expected_markers:
+                    assert (
+                        marker in error_str
+                    ), f"Expected marker '{marker}' not found in {error_class} for scenario '{error_scenario}'"
+                # Verify no agent markers
+                assert "WORKER AGENT ERROR" not in error_str
+                assert "AGENT DIAGNOSTICS" not in error_str
+        else:  # WorkerAgentError
+            from deadline_test_fixtures.deadline.worker import WorkerAgentError
+
+            try:
+                raise WorkerAgentError(
+                    message=error_scenario,
+                )
+            except WorkerAgentError as e:
+                error_str = str(e)
+                for marker in expected_markers:
+                    assert (
+                        marker in error_str
+                    ), f"Expected marker '{marker}' not found in {error_class} for scenario '{error_scenario}'"
+                # Verify no host markers
+                assert "WORKER HOST ERROR" not in error_str
+                assert "HOST DIAGNOSTICS" not in error_str
+
+    def test_property_12_command_failure_error_source(self, worker_config, mock_worker_host):
+        """
+        Property 12 extended: Command failures should indicate the appropriate error source
+
+        When a command fails, the error should indicate whether it was a host-level
+        command failure or an agent-level command failure.
+
+        **Validates: Requirements 6.5**
+        """
+        from deadline_test_fixtures.deadline.worker import WorkerAgentError
+        from deadline_test_fixtures.deadline.worker_host import CommandResult, WorkerHostError
+
+        # Test case 1: Host-level command failure (e.g., SSM command to host)
+        try:
+            raise WorkerHostError(
+                message="Failed to send command to host",
+                host_os="posix",
+                instance_id="i-123456",
+                diagnostics="SSM command timed out after 30 seconds",
+            )
+        except WorkerHostError as e:
+            error_str = str(e)
+            assert "WORKER HOST ERROR" in error_str
+            assert "Failed to send command to host" in error_str
+            assert "SSM command timed out" in error_str
+
+        # Test case 2: Agent-level command failure (e.g., agent configuration command)
+        cmd_result = CommandResult(
+            exit_code=1,
+            stdout="",
+            stderr="install-deadline-worker: command not found",
+        )
+
+        try:
+            raise WorkerAgentError(
+                message="Failed to install worker agent",
+                configuration=worker_config,
+                command_result=cmd_result,
+            )
+        except WorkerAgentError as e:
+            error_str = str(e)
+            assert "WORKER AGENT ERROR" in error_str
+            assert "Failed to install worker agent" in error_str
+            assert "install-deadline-worker: command not found" in error_str
+            assert "Command Exit Code: 1" in error_str
