@@ -134,19 +134,19 @@
 
 ## Phase 4: Update Fixtures and Integration
 
-- [ ] 11. Create worker_host fixture
+- [x] 11. Create worker_host fixture
   - Create new `worker_host` pytest fixture that provides EC2WorkerHost without agent
   - Implement OS detection and appropriate WorkerHost creation
   - Add proper lifecycle management (start on setup, stop on teardown)
   - _Requirements: 3.1, 3.2, 3.3, 3.4_
 
-- [ ] 12. Update existing worker fixture
+- [x] 12. Update existing worker fixture
   - Update `worker` fixture to depend on `worker_host` fixture
   - Modify worker creation to use explicit WorkerHost composition
   - Ensure backward compatibility for existing tests
   - _Requirements: 3.5_
 
-- [ ] 13. Update DeadlineWorkerConfiguration for host reuse and add property test
+- [x] 13. Update DeadlineWorkerConfiguration for host reuse and add property test
   - Ensure file_mappings behavior supports host reuse scenarios
   - Update configuration validation for new architecture
   - Write property test for configuration acceptance (**Property 20: Configuration acceptance**)

@@ -551,6 +551,110 @@ def ec2_worker_type(request: pytest.FixtureRequest) -> Generator[Type[DeadlineWo
 
 
 @pytest.fixture(scope="session")
+def worker_host(
+    request: pytest.FixtureRequest,
+    ec2_worker_type: Type[EC2InstanceWorker],
+) -> Generator[EC2WorkerHost, None, None]:
+    """
+    Gets an EC2 worker host without a worker agent for use in tests.
+
+    This fixture provides a running EC2 instance that can be used with different
+    worker agent configurations. The host is started during setup and stopped
+    during teardown.
+
+    Environment Variables:
+        SUBNET_ID: The subnet ID to deploy the EC2 worker host into (required).
+        SECURITY_GROUP_ID: The security group ID to deploy the EC2 worker host into (required).
+        AMI_ID: The AMI ID to use for the worker host.
+            Defaults to the latest AL2023 AMI for POSIX or WIN2022 for Windows.
+        WORKER_INSTANCE_TYPE: The EC2 instance type to use (default: "t3.micro").
+        WORKER_INSTANCE_SHUTDOWN_BEHAVIOR: Instance shutdown behavior (default: "stop").
+        KEEP_WORKER_AFTER_FAILURE: If set to "true", will not destroy the worker host when tests fail.
+            Useful for debugging. Default is "false".
+
+    Returns:
+        EC2WorkerHost: Instance of EC2WorkerHost (WindowsEC2WorkerHost or PosixEC2WorkerHost)
+            that can be used to create workers with different configurations.
+    """
+    LOG.info("Creating EC2 worker host")
+    ami_id = os.getenv("AMI_ID")
+    subnet_id = os.getenv("SUBNET_ID")
+    security_group_id = os.getenv("SECURITY_GROUP_ID")
+    instance_type = os.getenv("WORKER_INSTANCE_TYPE", default="t3.micro")
+    instance_shutdown_behavior = os.getenv("WORKER_INSTANCE_SHUTDOWN_BEHAVIOR", default="stop")
+
+    assert subnet_id, "SUBNET_ID is required when deploying an EC2 worker host"
+    assert security_group_id, "SECURITY_GROUP_ID is required when deploying an EC2 worker host"
+
+    bootstrap_resources: BootstrapResources = request.getfixturevalue("bootstrap_resources")
+    assert (
+        bootstrap_resources.worker_instance_profile_name
+    ), "Worker instance profile is required when deploying an EC2 worker host"
+
+    ec2_client = boto3.client("ec2")
+    s3_client = boto3.client("s3")
+    ssm_client = boto3.client("ssm")
+
+    # Create the appropriate WorkerHost based on the worker type
+    worker_host: EC2WorkerHost
+    if ec2_worker_type == PosixInstanceBuildWorker:
+        worker_host = PosixEC2WorkerHost(
+            subnet_id=subnet_id,
+            security_group_id=security_group_id,
+            instance_profile_name=bootstrap_resources.worker_instance_profile_name,
+            bootstrap_bucket_name=bootstrap_resources.bootstrap_bucket_name,
+            s3_client=s3_client,
+            ec2_client=ec2_client,
+            ssm_client=ssm_client,
+            instance_type=instance_type,
+            instance_shutdown_behavior=instance_shutdown_behavior,
+            override_ami_id=ami_id,
+        )
+    elif ec2_worker_type == WindowsInstanceBuildWorker:
+        worker_host = WindowsEC2WorkerHost(
+            subnet_id=subnet_id,
+            security_group_id=security_group_id,
+            instance_profile_name=bootstrap_resources.worker_instance_profile_name,
+            bootstrap_bucket_name=bootstrap_resources.bootstrap_bucket_name,
+            s3_client=s3_client,
+            ec2_client=ec2_client,
+            ssm_client=ssm_client,
+            instance_type=instance_type,
+            instance_shutdown_behavior=instance_shutdown_behavior,
+            override_ami_id=ami_id,
+        )
+    else:
+        raise ValueError(f"Unsupported worker type: {ec2_worker_type}")
+
+    def stop_worker_host():
+        if request.session.testsfailed > 0:
+            if os.getenv("KEEP_WORKER_AFTER_FAILURE", "false").lower() == "true":
+                LOG.info("KEEP_WORKER_AFTER_FAILURE is set, not stopping worker host")
+                return
+
+        try:
+            worker_host.stop()
+        except Exception as e:
+            LOG.exception(f"Error while stopping worker host: {e}")
+            LOG.error(
+                "Failed to stop worker host. Resources may be left over that need to be cleaned up manually."
+            )
+            raise
+
+    try:
+        worker_host.start()
+    except Exception as e:
+        LOG.exception(f"Failed to start worker host: {e}")
+        LOG.info("Stopping worker host because it failed to start")
+        stop_worker_host()
+        raise
+
+    yield worker_host
+
+    stop_worker_host()
+
+
+@pytest.fixture(scope="session")
 def worker(
     request: pytest.FixtureRequest,
     worker_config: DeadlineWorkerConfiguration,
@@ -559,16 +663,18 @@ def worker(
     """
     Gets a DeadlineWorker for use in tests.
 
+    For EC2 workers, this fixture depends on the worker_host fixture and creates a fully
+    configured worker (host + agent) using explicit WorkerHost composition. The worker host
+    is already started by the worker_host fixture before the worker agent is configured.
+
+    For Docker workers, this fixture creates a standalone DockerContainerWorker without
+    requiring a worker_host.
+
     Environment Variables:
-        SUBNET_ID: The subnet ID to deploy the EC2 worker into.
-            This is required for EC2 workers. Does not apply if USE_DOCKER_WORKER is true.
-        SECURITY_GROUP_ID: The security group ID to deploy the EC2 worker into.
-            This is required for EC2 workers. Does not apply if USE_DOCKER_WORKER is true.
-        AMI_ID: The AMI ID to use for the Worker agent.
-            Defaults to the latest AL2023 AMI.
-            Does not apply if USE_DOCKER_WORKER is true.
-        USE_DOCKER_WORKER: If set to "true", this fixture will create a Worker that runs in a local Docker container instead of an EC2 instance.
-        KEEP_WORKER_AFTER_FAILURE: If set to "true", will not destroy the Worker when it fails. Useful for debugging. Default is "false"
+        USE_DOCKER_WORKER: If set to "true", this fixture will create a Worker that runs
+            in a local Docker container instead of an EC2 instance.
+        KEEP_WORKER_AFTER_FAILURE: If set to "true", will not destroy the Worker when it fails.
+            Useful for debugging. Default is "false"
 
     Returns:
         DeadlineWorker: Instance of the DeadlineWorker class that can be used to interact with the Worker.
@@ -581,56 +687,10 @@ def worker(
             configuration=worker_config,
         )
     else:
-        LOG.info("Creating EC2 worker")
-        ami_id = os.getenv("AMI_ID")
-        subnet_id = os.getenv("SUBNET_ID")
-        security_group_id = os.getenv("SECURITY_GROUP_ID")
-        instance_type = os.getenv("WORKER_INSTANCE_TYPE", default="t3.micro")
-        instance_shutdown_behavior = os.getenv("WORKER_INSTANCE_SHUTDOWN_BEHAVIOR", default="stop")
-
-        assert subnet_id, "SUBNET_ID is required when deploying an EC2 worker"
-        assert security_group_id, "SECURITY_GROUP_ID is required when deploying an EC2 worker"
-
-        bootstrap_resources: BootstrapResources = request.getfixturevalue("bootstrap_resources")
-        assert (
-            bootstrap_resources.worker_instance_profile_name
-        ), "Worker instance profile is required when deploying an EC2 worker"
-
-        ec2_client = boto3.client("ec2")
-        s3_client = boto3.client("s3")
-        ssm_client = boto3.client("ssm")
+        LOG.info("Creating EC2 worker with existing worker host")
+        # Conditionally request worker_host fixture only for EC2 workers
+        worker_host: EC2WorkerHost = request.getfixturevalue("worker_host")
         deadline_client = boto3.client("deadline")
-
-        # Create the appropriate WorkerHost based on the worker type
-        worker_host: EC2WorkerHost
-        if ec2_worker_type == PosixInstanceBuildWorker:
-            worker_host = PosixEC2WorkerHost(
-                subnet_id=subnet_id,
-                security_group_id=security_group_id,
-                instance_profile_name=bootstrap_resources.worker_instance_profile_name,
-                bootstrap_bucket_name=bootstrap_resources.bootstrap_bucket_name,
-                s3_client=s3_client,
-                ec2_client=ec2_client,
-                ssm_client=ssm_client,
-                instance_type=instance_type,
-                instance_shutdown_behavior=instance_shutdown_behavior,
-                override_ami_id=ami_id,
-            )
-        elif ec2_worker_type == WindowsInstanceBuildWorker:
-            worker_host = WindowsEC2WorkerHost(
-                subnet_id=subnet_id,
-                security_group_id=security_group_id,
-                instance_profile_name=bootstrap_resources.worker_instance_profile_name,
-                bootstrap_bucket_name=bootstrap_resources.bootstrap_bucket_name,
-                s3_client=s3_client,
-                ec2_client=ec2_client,
-                ssm_client=ssm_client,
-                instance_type=instance_type,
-                instance_shutdown_behavior=instance_shutdown_behavior,
-                override_ami_id=ami_id,
-            )
-        else:
-            raise ValueError(f"Unsupported worker type: {ec2_worker_type}")
 
         worker = ec2_worker_type(
             configuration=worker_config,

@@ -42,6 +42,7 @@ from .fixtures import (
     service_model,
     worker,
     worker_config,
+    worker_host,
 )
 from .job_attachment_manager import JobAttachmentManager
 from .models import (
@@ -105,4 +106,5 @@ __all__ = [
     "WindowsEC2WorkerHost",
     "worker_config",
     "worker",
+    "worker_host",
 ]

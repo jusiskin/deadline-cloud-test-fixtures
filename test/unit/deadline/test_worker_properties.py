@@ -1487,3 +1487,402 @@ class TestErrorDiagnosticsProperties:
             assert "Failed to install worker agent" in error_str
             assert "install-deadline-worker: command not found" in error_str
             assert "Command Exit Code: 1" in error_str
+
+
+class TestConfigurationAcceptanceProperties:
+    """Property tests for configuration acceptance."""
+
+    def test_property_20_configuration_acceptance(self, worker_config, mock_worker_host):
+        """
+        Property 20: Configuration acceptance
+
+        For any worker agent setup operation, the operation should accept a
+        DeadlineWorkerConfiguration object containing all necessary configuration parameters.
+
+        **Validates: Requirements 5.1**
+        """
+        with patch("boto3.client"):
+            # Given: A DeadlineWorkerConfiguration object with all necessary parameters
+            # When: Creating a worker with the configuration
+            worker = PosixInstanceBuildWorker(
+                configuration=worker_config,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+            # Then: Worker should accept the configuration
+            assert worker.configuration == worker_config
+            assert worker.configuration.farm_id == "farm-123"
+            assert worker.configuration.fleet.id == "fleet_123"
+            assert worker.configuration.region == "us-west-2"
+            assert worker.configuration.job_user == "test-user"
+            assert worker.configuration.job_user_group == "test-group"
+            assert worker.configuration.allow_shutdown is False
+
+            # When: Starting the worker agent with the configuration
+            with (
+                patch.object(worker, "_transfer_files", return_value=None),
+                patch.object(worker, "get_worker_id", return_value="worker-test123"),
+            ):
+                worker.start()
+
+                # Then: Worker agent should be running with the configuration
+                assert worker.agent_state == WorkerAgentState.RUNNING
+                assert worker.worker_id == "worker-test123"
+
+                # Verify the configuration was used during agent setup
+                # The configure_worker_command should be called with the configuration
+                configure_cmd = worker.configure_worker_command(config=worker_config)
+                assert "farm-123" in configure_cmd
+                assert "fleet_123" in configure_cmd
+                assert "us-west-2" in configure_cmd
+
+                worker.stop()
+
+    @pytest.mark.parametrize(
+        "config_params",
+        [
+            # Minimal configuration
+            {
+                "farm_id": "farm-minimal",
+                "fleet_id": "fleet-minimal",
+                "region": "us-west-2",
+                "job_user": "job-user",
+                "job_user_group": "job-group",
+                "allow_shutdown": False,
+            },
+            # Configuration with file mappings
+            {
+                "farm_id": "farm-files",
+                "fleet_id": "fleet-files",
+                "region": "us-east-1",
+                "job_user": "job-user",
+                "job_user_group": "job-group",
+                "allow_shutdown": True,
+                "file_mappings": [
+                    ("/local/file1.txt", "/remote/file1.txt"),
+                    ("/local/file2.json", "/remote/file2.json"),
+                ],
+            },
+            # Configuration with environment variables
+            {
+                "farm_id": "farm-env",
+                "fleet_id": "fleet-env",
+                "region": "eu-west-1",
+                "job_user": "custom-user",
+                "job_user_group": "custom-group",
+                "allow_shutdown": True,
+                "worker_env_var": {
+                    "CUSTOM_VAR": "value",
+                    "FEATURE_FLAG": "enabled",
+                },
+            },
+            # Configuration with pre-install commands
+            {
+                "farm_id": "farm-preinstall",
+                "fleet_id": "fleet-preinstall",
+                "region": "ap-southeast-1",
+                "job_user": "job-user",
+                "job_user_group": "job-group",
+                "allow_shutdown": False,
+                "pre_install_commands": [
+                    "apt-get update",
+                    "apt-get install -y python3-pip",
+                ],
+            },
+            # Configuration with session root directory
+            {
+                "farm_id": "farm-session",
+                "fleet_id": "fleet-session",
+                "region": "us-west-1",
+                "job_user": "job-user",
+                "job_user_group": "job-group",
+                "allow_shutdown": True,
+                "session_root_dir": "/mnt/sessions",
+            },
+            # Configuration with all optional parameters
+            {
+                "farm_id": "farm-full",
+                "fleet_id": "fleet-full",
+                "region": "us-east-2",
+                "job_user": "full-user",
+                "job_user_group": "full-group",
+                "allow_shutdown": True,
+                "file_mappings": [("/src/config.yaml", "/etc/config.yaml")],
+                "pre_install_commands": ["echo 'Setup starting'"],
+                "worker_env_var": {"ENV_VAR": "value"},
+                "session_root_dir": "/custom/sessions",
+                "start_service": True,
+                "no_install_service": False,
+            },
+        ],
+    )
+    def test_property_20_various_configurations(self, config_params, mock_worker_host):
+        """
+        Property 20 extended: Configuration acceptance with various parameter combinations
+
+        Test that worker agent setup accepts DeadlineWorkerConfiguration objects with
+        various combinations of required and optional parameters.
+
+        **Validates: Requirements 5.1**
+        """
+        # Create configuration with specific parameters
+        config = DeadlineWorkerConfiguration(
+            farm_id=config_params["farm_id"],
+            fleet=Fleet(
+                id=config_params["fleet_id"],
+                farm=Farm(id=config_params["farm_id"]),
+            ),
+            region=config_params["region"],
+            job_user=config_params["job_user"],
+            job_user_group=config_params["job_user_group"],
+            allow_shutdown=config_params["allow_shutdown"],
+            worker_agent_install=PipInstall(
+                requirement_specifiers=["deadline-cloud-worker-agent"],
+                codeartifact=CodeArtifactRepositoryInfo(
+                    region=config_params["region"],
+                    domain="test-domain",
+                    domain_owner="123456789123",
+                    repository="test-repository",
+                ),
+            ),
+            file_mappings=config_params.get("file_mappings"),
+            pre_install_commands=config_params.get("pre_install_commands"),
+            worker_env_var=config_params.get("worker_env_var"),
+            session_root_dir=config_params.get("session_root_dir"),
+            start_service=config_params.get("start_service", True),
+            no_install_service=config_params.get("no_install_service", False),
+        )
+
+        with patch("boto3.client"):
+            # When: Creating a worker with the configuration
+            worker = PosixInstanceBuildWorker(
+                configuration=config,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+            # Then: Worker should accept the configuration
+            assert worker.configuration == config
+            assert worker.configuration.farm_id == config_params["farm_id"]
+            assert worker.configuration.fleet.id == config_params["fleet_id"]
+            assert worker.configuration.region == config_params["region"]
+            assert worker.configuration.job_user == config_params["job_user"]
+            assert worker.configuration.job_user_group == config_params["job_user_group"]
+            assert worker.configuration.allow_shutdown == config_params["allow_shutdown"]
+
+            # Verify optional parameters
+            if "file_mappings" in config_params:
+                assert worker.configuration.file_mappings == config_params["file_mappings"]
+            if "pre_install_commands" in config_params:
+                assert (
+                    worker.configuration.pre_install_commands
+                    == config_params["pre_install_commands"]
+                )
+            if "worker_env_var" in config_params:
+                assert worker.configuration.worker_env_var == config_params["worker_env_var"]
+            if "session_root_dir" in config_params:
+                assert worker.configuration.session_root_dir == config_params["session_root_dir"]
+
+            # When: Starting the worker agent
+            with (
+                patch.object(worker, "_transfer_files", return_value=None),
+                patch.object(worker, "get_worker_id", return_value="worker-test123"),
+            ):
+                worker.start()
+
+                # Then: Worker agent should be running with the configuration
+                assert worker.agent_state == WorkerAgentState.RUNNING
+                assert worker.worker_id == "worker-test123"
+
+                worker.stop()
+
+    def test_property_20_configuration_with_host_reuse(self, mock_worker_host):
+        """
+        Property 20 extended: Configuration acceptance supports host reuse scenarios
+
+        Test that multiple different configurations can be applied sequentially to the
+        same host, demonstrating that configuration acceptance supports host reuse.
+
+        **Validates: Requirements 5.1, 5.3, 5.5**
+        """
+        # Create three different configurations
+        config_a = DeadlineWorkerConfiguration(
+            farm_id="farm-a",
+            fleet=Fleet(id="fleet-a", farm=Farm(id="farm-a")),
+            region="us-west-2",
+            job_user="user-a",
+            job_user_group="group-a",
+            allow_shutdown=False,
+            worker_agent_install=PipInstall(
+                requirement_specifiers=["deadline-cloud-worker-agent==1.0.0"],
+                codeartifact=CodeArtifactRepositoryInfo(
+                    region="us-west-2",
+                    domain="domain-a",
+                    domain_owner="123456789123",
+                    repository="repo-a",
+                ),
+            ),
+            file_mappings=[("/local/a.txt", "/remote/a.txt")],
+        )
+
+        config_b = DeadlineWorkerConfiguration(
+            farm_id="farm-b",
+            fleet=Fleet(id="fleet-b", farm=Farm(id="farm-b")),
+            region="us-east-1",
+            job_user="user-b",
+            job_user_group="group-b",
+            allow_shutdown=True,
+            worker_agent_install=PipInstall(
+                requirement_specifiers=["deadline-cloud-worker-agent==2.0.0"],
+                codeartifact=CodeArtifactRepositoryInfo(
+                    region="us-east-1",
+                    domain="domain-b",
+                    domain_owner="987654321987",
+                    repository="repo-b",
+                ),
+            ),
+            worker_env_var={"ENV_B": "value_b"},
+        )
+
+        config_c = DeadlineWorkerConfiguration(
+            farm_id="farm-c",
+            fleet=Fleet(id="fleet-c", farm=Farm(id="farm-c")),
+            region="eu-west-1",
+            job_user="user-c",
+            job_user_group="group-c",
+            allow_shutdown=True,
+            worker_agent_install=PipInstall(
+                requirement_specifiers=["deadline-cloud-worker-agent==3.0.0"],
+                codeartifact=CodeArtifactRepositoryInfo(
+                    region="eu-west-1",
+                    domain="domain-c",
+                    domain_owner="111222333444",
+                    repository="repo-c",
+                ),
+            ),
+            session_root_dir="/custom/sessions",
+        )
+
+        with patch("boto3.client"):
+            # Create three workers with different configurations (same host)
+            worker_a = PosixInstanceBuildWorker(
+                configuration=config_a,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+            worker_b = PosixInstanceBuildWorker(
+                configuration=config_b,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+            worker_c = PosixInstanceBuildWorker(
+                configuration=config_c,
+                worker_host=mock_worker_host,
+                deadline_client=MagicMock(),
+            )
+
+        with (
+            patch.object(worker_a, "_transfer_files", return_value=None),
+            patch.object(worker_a, "get_worker_id", return_value="worker-aaa"),
+            patch.object(worker_b, "_transfer_files", return_value=None),
+            patch.object(worker_b, "get_worker_id", return_value="worker-bbb"),
+            patch.object(worker_c, "_transfer_files", return_value=None),
+            patch.object(worker_c, "get_worker_id", return_value="worker-ccc"),
+        ):
+            # Apply configuration A
+            worker_a.start()
+            assert worker_a.configuration == config_a
+            assert worker_a.configuration.farm_id == "farm-a"
+            assert worker_a.configuration.file_mappings == [("/local/a.txt", "/remote/a.txt")]
+            worker_a.stop()
+
+            # Apply configuration B to the same host
+            worker_b.start()
+            assert worker_b.configuration == config_b
+            assert worker_b.configuration.farm_id == "farm-b"
+            assert worker_b.configuration.worker_env_var == {"ENV_B": "value_b"}
+            worker_b.stop()
+
+            # Apply configuration C to the same host
+            worker_c.start()
+            assert worker_c.configuration == config_c
+            assert worker_c.configuration.farm_id == "farm-c"
+            assert worker_c.configuration.session_root_dir == "/custom/sessions"
+            worker_c.stop()
+
+    @pytest.mark.parametrize(
+        "os_type,worker_class",
+        [
+            ("posix", "PosixInstanceBuildWorker"),
+            ("windows", "WindowsInstanceBuildWorker"),
+        ],
+    )
+    def test_property_20_configuration_acceptance_cross_platform(
+        self, os_type, worker_class, worker_config
+    ):
+        """
+        Property 20 extended: Configuration acceptance works across platforms
+
+        Test that DeadlineWorkerConfiguration is accepted by both Windows and POSIX workers.
+
+        **Validates: Requirements 5.1**
+        """
+        # Import the appropriate classes based on OS type
+        if os_type == "posix":
+            from deadline_test_fixtures.deadline.worker import PosixInstanceBuildWorker
+            from deadline_test_fixtures.deadline.worker_host import PosixEC2WorkerHost
+
+            WorkerClass: type = PosixInstanceBuildWorker
+            HostClass: type = PosixEC2WorkerHost
+        else:
+            from deadline_test_fixtures.deadline.worker import WindowsInstanceBuildWorker
+            from deadline_test_fixtures.deadline.worker_host import WindowsEC2WorkerHost
+
+            WorkerClass = WindowsInstanceBuildWorker
+            HostClass = WindowsEC2WorkerHost
+
+        # Create a mock host for the specific OS
+        mock_host = MagicMock(spec=HostClass)
+        mock_host.is_running.return_value = True
+        mock_host._operating_system.return_value = os_type
+        mock_host.instance_id = "i-1234567890abcdef0"
+        mock_host.send_command.return_value = MagicMock(exit_code=0, stdout="worker-test123")
+
+        # Add all the required attributes
+        mock_host.subnet_id = "subnet-12345"
+        mock_host.security_group_id = "sg-12345"
+        mock_host.instance_profile_name = "test-profile"
+        mock_host.bootstrap_bucket_name = "test-bucket"
+        mock_host.s3_client = MagicMock()
+        mock_host.ec2_client = MagicMock()
+        mock_host.ssm_client = MagicMock()
+        mock_host.instance_type = "t3.micro"
+        mock_host.instance_shutdown_behavior = "terminate"
+        mock_host.additional_tags = []
+
+        with patch("boto3.client"):
+            # When: Creating a worker with the configuration
+            worker = WorkerClass(
+                configuration=worker_config,
+                worker_host=mock_host,
+                deadline_client=MagicMock(),
+            )
+
+            # Then: Worker should accept the configuration regardless of OS
+            assert worker.configuration == worker_config
+            assert worker.configuration.farm_id == "farm-123"
+            assert worker.configuration.fleet.id == "fleet_123"
+
+            # When: Starting the worker agent
+            with (
+                patch.object(worker, "_transfer_files", return_value=None),
+                patch.object(worker, "get_worker_id", return_value="worker-test123"),
+            ):
+                worker.start()
+
+                # Then: Worker agent should be running with the configuration
+                assert worker.agent_state == WorkerAgentState.RUNNING
+                assert worker.worker_id == "worker-test123"
+
+                worker.stop()

@@ -204,6 +204,64 @@ class WorkerAgentError(Exception):
 
 @dataclass(frozen=True)
 class DeadlineWorkerConfiguration:
+    """
+    Configuration for a Deadline Cloud worker agent.
+
+    This configuration is used when starting a worker agent on a worker host. It contains
+    all the parameters needed to install, configure, and start the worker agent software.
+
+    The configuration supports host reuse scenarios where multiple different worker agent
+    configurations can be applied sequentially to the same worker host. When a worker agent
+    is stopped, all agent state and staged files are cleaned up, leaving the host ready for
+    a new configuration.
+
+    Args:
+        farm_id: The Deadline Cloud farm ID
+        fleet: The Deadline Cloud fleet object
+        region: AWS region for the Deadline Cloud service
+        allow_shutdown: Whether the worker agent is allowed to shut down the host
+        worker_agent_install: PipInstall configuration for the worker agent package
+        start_service: Whether to start the worker agent service after configuration
+        no_install_service: Whether to skip installing the worker agent as a service
+        service_model_path: Optional path to a custom service model file
+        no_local_session_logs: Optional flag to disable local session logs
+        disallow_instance_profile: Optional flag to disallow instance profile usage
+        file_mappings: List of (source_path, destination_path) tuples for files to copy
+            from the local machine to the worker host. Files are staged during worker agent
+            start and cleaned up during worker agent stop, supporting host reuse scenarios.
+        pre_install_commands: Commands to run before installing the worker agent
+        job_user: User account for running jobs (default: "job-user")
+        agent_user: User account for running the worker agent (default: "deadline-worker")
+        windows_user_secret: Optional secret ARN for Windows user credentials
+        job_user_group: Group for job users (default: "deadline-job-users")
+        job_users: List of POSIX session users for job execution
+        windows_job_users: List of Windows users for job execution
+        session_root_dir: Optional custom path for worker session directories
+        worker_env_var: Optional environment variables for the worker agent
+
+    Example:
+        >>> config = DeadlineWorkerConfiguration(
+        ...     farm_id="farm-123",
+        ...     fleet=Fleet(id="fleet-456", farm=Farm(id="farm-123")),
+        ...     region="us-west-2",
+        ...     allow_shutdown=True,
+        ...     worker_agent_install=PipInstall(
+        ...         requirement_specifiers=["deadline-cloud-worker-agent"],
+        ...     ),
+        ...     file_mappings=[
+        ...         ("/local/config.yaml", "/etc/worker/config.yaml"),
+        ...         ("/local/scripts/*", "/opt/scripts/"),
+        ...     ],
+        ... )
+        >>> worker = PosixInstanceBuildWorker(
+        ...     configuration=config,
+        ...     worker_host=host,
+        ...     deadline_client=client,
+        ... )
+        >>> worker.start()  # Installs agent, stages files, starts service
+        >>> worker.stop()   # Stops service, cleans up files and state
+    """
+
     farm_id: str
     fleet: Fleet
     region: str
@@ -216,7 +274,16 @@ class DeadlineWorkerConfiguration:
     disallow_instance_profile: str | None = None
 
     file_mappings: list[tuple[str, str]] | None = None
-    """Mapping of files to copy from host environment to worker environment"""
+    """
+    Mapping of files to copy from local machine to worker host.
+    
+    Each tuple is (source_path, destination_path) where:
+    - source_path: Local file path or glob pattern (e.g., "/local/file.txt" or "/local/*.yaml")
+    - destination_path: Destination path on the worker host (e.g., "/etc/config/file.txt")
+    
+    Files are staged during worker agent start() and cleaned up during worker agent stop(),
+    supporting host reuse scenarios where different configurations can be applied sequentially.
+    """
 
     pre_install_commands: list[str] | None = None
     """Commands to run before installing the Worker agent"""
@@ -238,6 +305,7 @@ class DeadlineWorkerConfiguration:
     """Path to parent directory of worker session directories"""
 
     worker_env_var: Dict[str, str] | None = None
+    """Additional environment variables to configure for the worker agent"""
     """Additional feature flag to configure for workers"""
 
 
