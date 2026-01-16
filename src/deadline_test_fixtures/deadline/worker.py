@@ -723,6 +723,13 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
             'Remove-Item -Path "C:\\ProgramData\\Amazon\\Deadline\\Logs\\*" -Force -Recurse -ErrorAction SilentlyContinue',
         ]
 
+        # Remove Windows job users
+        if self.configuration.windows_job_users:
+            for job_user in self.configuration.windows_job_users:
+                cleanup_commands.append(
+                    f"Remove-LocalUser -Name {job_user} -ErrorAction SilentlyContinue"
+                )
+
         for cmd in cleanup_commands:
             try:
                 self.send_command(cmd)
@@ -807,6 +814,29 @@ class WindowsInstanceWorkerBase(EC2InstanceWorker):
         """
 
         cmds = ["$ErrorActionPreference = 'Stop'"]
+
+        # Create Windows job users if configured
+        if config.windows_user_secret and config.windows_job_users:
+            cmds.append(
+                f"$secret = aws secretsmanager get-secret-value --secret-id {config.windows_user_secret} --query SecretString --output text | ConvertFrom-Json"
+            )
+            cmds.append(
+                "$password = ConvertTo-SecureString -String $($secret.password) -AsPlainText -Force"
+            )
+
+            for job_user in config.windows_job_users:
+                # Check if user exists, create if not
+                cmds.append(
+                    f"if (-not (Get-LocalUser -Name {job_user} -ErrorAction SilentlyContinue)) {{ "
+                    f"New-LocalUser -Name {job_user} -Password $password -FullName {job_user} -Description '{job_user}' -PasswordNeverExpires }}"
+                )
+                # Load user profile
+                cmds.append(
+                    f"$Cred = New-Object System.Management.Automation.PSCredential {job_user}, $password"
+                )
+                cmds.append(
+                    "Start-Process cmd.exe -Credential $Cred -ArgumentList '/C' -LoadUserProfile -NoNewWindow -Wait"
+                )
 
         if config.service_model_path:
             cmds.append(
@@ -986,6 +1016,14 @@ class PosixInstanceWorkerBase(EC2InstanceWorker):
             "rm -rf /var/log/amazon/deadline/*",
         ]
 
+        # Remove job users
+        for job_user in self.configuration.job_users:
+            cleanup_commands.append(f"userdel -r {job_user.user} || true")
+            cleanup_commands.append(f"groupdel {job_user.group} || true")
+
+        # Remove job user group
+        cleanup_commands.append(f"groupdel {self.configuration.job_user_group} || true")
+
         for cmd in cleanup_commands:
             try:
                 self.send_command(cmd)
@@ -1133,31 +1171,45 @@ class PosixInstanceBuildWorker(PosixInstanceWorkerBase):
         """Get the command to configure the Worker. This must be run as root."""
         cmds = [
             "set -x",
-            "source /opt/deadline/worker/bin/activate",
-            f"AWS_DEFAULT_REGION={self.configuration.region}",
-            config.worker_agent_install.install_command_for_linux,
-            *(config.pre_install_commands or []),
-            # fmt: off
-            (
-                "install-deadline-worker "
-                + "-y "
-                + f"--farm-id {config.farm_id} "
-                + f"--fleet-id {config.fleet.id} "
-                + f"--region {config.region} "
-                + f"--user {config.agent_user} "
-                + f"--group {config.job_user_group} "
-                + f"{'--allow-shutdown ' if config.allow_shutdown else ''}"
-                + f"{'--no-install-service ' if config.no_install_service else ''}"
-                + f"{'--disallow-instance-profile ' if config.disallow_instance_profile else ''}"
-                + (
-                    f"--session-root-dir {config.session_root_dir} "
-                    if config.session_root_dir is not None
-                    else ""
-                )
-            ),
-            # fmt: on
-            f"runuser --login {self.configuration.agent_user} --command 'echo \"source /opt/deadline/worker/bin/activate\" >> $HOME/.bashrc'",
+            # Create job user group
+            f"groupadd -f --system {config.job_user_group}",
         ]
+
+        # Create job users and their groups
+        for job_user in config.job_users:
+            cmds.append(f"groupadd -f {job_user.group}")
+            cmds.append(
+                f"useradd --create-home --system --shell=/bin/bash --groups={config.job_user_group} -g {job_user.group} {job_user.user}"
+            )
+
+        cmds.extend(
+            [
+                "source /opt/deadline/worker/bin/activate",
+                f"AWS_DEFAULT_REGION={self.configuration.region}",
+                config.worker_agent_install.install_command_for_linux,
+                *(config.pre_install_commands or []),
+                # fmt: off
+                (
+                    "install-deadline-worker "
+                    + "-y "
+                    + f"--farm-id {config.farm_id} "
+                    + f"--fleet-id {config.fleet.id} "
+                    + f"--region {config.region} "
+                    + f"--user {config.agent_user} "
+                    + f"--group {config.job_user_group} "
+                    + f"{'--allow-shutdown ' if config.allow_shutdown else ''}"
+                    + f"{'--no-install-service ' if config.no_install_service else ''}"
+                    + f"{'--disallow-instance-profile ' if config.disallow_instance_profile else ''}"
+                    + (
+                        f"--session-root-dir {config.session_root_dir} "
+                        if config.session_root_dir is not None
+                        else ""
+                    )
+                ),
+                # fmt: on
+                f"runuser --login {self.configuration.agent_user} --command 'echo \"source /opt/deadline/worker/bin/activate\" >> $HOME/.bashrc'",
+            ]
+        )
 
         for job_user in self.configuration.job_users:
             cmds.append(f"usermod -a -G {job_user.group} {self.configuration.agent_user}")
